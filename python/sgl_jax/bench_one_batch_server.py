@@ -62,6 +62,10 @@ class BenchArgs:
     gsp_num_turns: int = 1
     gsp_fast_prepare: bool = False
     gsp_ordered: bool = False
+    chip_hourly_cost: float = 5.40
+    dws_chip_hourly_cost: float = 6.00
+    num_chips: int = 0
+    cluster_hourly_cost: float = 0.0
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -106,6 +110,10 @@ class BenchArgs:
         parser.add_argument("--gsp-num-turns", type=int, default=BenchArgs.gsp_num_turns)
         parser.add_argument("--gsp-fast-prepare", action="store_true", default=BenchArgs.gsp_fast_prepare)
         parser.add_argument("--gsp-ordered", action="store_true", default=BenchArgs.gsp_ordered)
+        parser.add_argument("--chip-hourly-cost", type=float, default=BenchArgs.chip_hourly_cost)
+        parser.add_argument("--dws-chip-hourly-cost", type=float, default=BenchArgs.dws_chip_hourly_cost)
+        parser.add_argument("--num-chips", type=int, default=BenchArgs.num_chips)
+        parser.add_argument("--cluster-hourly-cost", type=float, default=BenchArgs.cluster_hourly_cost)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -166,12 +174,17 @@ def run_one_case(
 
     # Determine whether to use text or input_ids based on API type
     return_text = api_type == "openai"
-    
-    if bench_args is not None and getattr(bench_args, "dataset_name", "") == "generated-shared-prefix":
+    is_warmup = (run_name == "")
+
+    if (
+        not is_warmup
+        and bench_args is not None
+        and getattr(bench_args, "dataset_name", "") == "generated-shared-prefix"
+    ):
         # Override prompts_per_group so we can test different batch sizes in one run
         dynamic_prompts_per_group = max(1, batch_size // bench_args.gsp_num_groups)
         bench_args.gsp_prompts_per_group = dynamic_prompts_per_group
-        
+
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=bench_args.gsp_num_groups,
             prompts_per_group=dynamic_prompts_per_group,
@@ -215,6 +228,9 @@ def run_one_case(
         profile_link: str = run_profile(url, 3, ["CPU", "GPU"], None, None, profile_by_stage)
 
     tic = time.perf_counter()
+    rid_prompt_tokens = {}
+    rid_cached_tokens = {}
+    rid_first_token_time = {}
 
     if api_type == "openai":
         # Use OpenAI API - send requests as a batch with n parameter
@@ -282,7 +298,7 @@ def run_one_case(
             "return_logprob": return_logprob,
             "stream": True,
         }
-        if getattr(bench_args, "dataset_name", "") == "generated-shared-prefix":
+        if not is_warmup and getattr(bench_args, "dataset_name", "") == "generated-shared-prefix":
             json_data["text"] = [req.prompt for req in input_requests]
         else:
             json_data["input_ids"] = [req.prompt for req in input_requests]
@@ -304,31 +320,73 @@ def run_one_case(
                 if "error" in data:
                     raise RuntimeError(f"Request has failed. {data}.")
 
+                meta = data["meta_info"]
                 assert (
-                    data["meta_info"]["finish_reason"] is None
-                    or data["meta_info"]["finish_reason"]["type"] == "length"
+                    meta["finish_reason"] is None
+                    or meta["finish_reason"]["type"] == "length"
                 )
-                if data["meta_info"]["completion_tokens"] == 1:
-                    ttft = time.perf_counter() - tic
+                rid = meta.get("id", len(rid_first_token_time))
+                if "prompt_tokens" in meta:
+                    rid_prompt_tokens[rid] = int(meta["prompt_tokens"])
+                if "cached_tokens" in meta:
+                    rid_cached_tokens[rid] = max(rid_cached_tokens.get(rid, 0), int(meta["cached_tokens"]))
+                if meta["completion_tokens"] == 1 or (meta["completion_tokens"] > 0 and rid not in rid_first_token_time):
+                    now_dt = time.perf_counter() - tic
+                    rid_first_token_time[rid] = now_dt
+                    ttft = now_dt
 
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
     output_throughput = batch_size * output_len / (latency - ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
 
+    total_prompt_tokens = sum(rid_prompt_tokens.values()) if rid_prompt_tokens else (batch_size * input_len)
+    total_cached_tokens = sum(rid_cached_tokens.values())
+    prefix_cache_hit_rate = total_cached_tokens / max(1, total_prompt_tokens)
+
     server_info = requests.get(url + "/get_server_info").json()
     acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
     last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
+    srv_tp = int(server_info.get("tp_size", 1) or 1)
+    srv_dp = int(server_info.get("dp_size", 1) or 1)
+    srv_ep = int(server_info.get("ep_size", 1) or 1)
+    srv_device = server_info.get("device", "tpu")
+    num_devices = max(srv_tp, srv_dp, srv_ep)
+    if bench_args is not None and bench_args.num_chips > 0:
+        num_chips = bench_args.num_chips
+    elif srv_device == "tpu" and num_devices >= 2:
+        num_chips = num_devices // 2
+    else:
+        num_chips = max(1, num_devices)
+
+    chip_hourly_cost = bench_args.chip_hourly_cost if bench_args is not None else 5.40
+    dws_chip_hourly_cost = bench_args.dws_chip_hourly_cost if bench_args is not None else 6.00
+    slice_cud_hourly_cost = (
+        bench_args.cluster_hourly_cost
+        if (bench_args is not None and bench_args.cluster_hourly_cost > 0)
+        else chip_hourly_cost * num_chips
+    )
+    slice_dws_hourly_cost = dws_chip_hourly_cost * num_chips
+    itl_ms = 1.0 / (output_throughput / batch_size) * 1000.0
+    input_util = 0.70
+    input_cost_chip_cud = 1e6 / (input_throughput * input_util) / 3600.0 * chip_hourly_cost
+    output_cost_chip_cud = 1e6 / output_throughput / 3600.0 * chip_hourly_cost
+    input_cost_slice_cud = 1e6 / (input_throughput * input_util) / 3600.0 * slice_cud_hourly_cost
+    output_cost_slice_cud = 1e6 / output_throughput / 3600.0 * slice_cud_hourly_cost
+    output_cost_slice_dws = 1e6 / output_throughput / 3600.0 * slice_dws_hourly_cost
 
     print(f"batch size: {batch_size}")
     print(f"input_len: {input_len}")
     print(f"output_len: {output_len}")
     print(f"latency: {latency:.2f} s")
     print(f"ttft: {ttft:.2f} s")
+    print(f"itl: {itl_ms:.2f} ms")
     print(f"last generation throughput: {last_gen_throughput:.2f} tok/s")
-    print(f"input throughput: {input_throughput:.2f} tok/s")
+    print(f"input throughput: {input_throughput:.2f} tok/s ({input_throughput / num_chips:.2f} tok/s/chip)")
     if output_len != 1:
-        print(f"output throughput: {output_throughput:.2f} tok/s")
+        print(f"output throughput: {output_throughput:.2f} tok/s ({output_throughput / num_chips:.2f} tok/s/chip)")
+    print(f"prefix_cache_hit_rate: {prefix_cache_hit_rate:.4f} ({total_cached_tokens}/{total_prompt_tokens})")
+    print(f"output cost ($/1M, CUD $5.40/chip-hr): ${output_cost_chip_cud:.3f} | 16-chip slice CUD ($86.40/hr): ${output_cost_slice_cud:.3f} | DWS ($96.00/hr): ${output_cost_slice_dws:.3f}")
 
     if result_filename:
         with open(result_filename, "a") as fout:
@@ -338,9 +396,23 @@ def run_one_case(
                 "input_len": input_len,
                 "output_len": output_len,
                 "latency": round(latency, 4),
+                "ttft": round(ttft, 4),
+                "itl_ms": round(itl_ms, 2),
+                "input_throughput": round(input_throughput, 2),
                 "output_throughput": round(output_throughput, 2),
+                "output_throughput_per_chip": round(output_throughput / num_chips, 2),
                 "overall_throughput": round(overall_throughput, 2),
                 "last_gen_throughput": round(last_gen_throughput, 2),
+                "acc_length": round(acc_length, 3) if acc_length is not None else None,
+                "prefix_cache_hit_rate": round(prefix_cache_hit_rate, 4),
+                "cached_tokens": total_cached_tokens,
+                "prompt_tokens": total_prompt_tokens,
+                "num_chips": num_chips,
+                "input_cost_per_1m_usd": round(input_cost_chip_cud, 4),
+                "output_cost_per_1m_usd": round(output_cost_chip_cud, 4),
+                "input_cost_slice_cud_per_1m_usd": round(input_cost_slice_cud, 4),
+                "output_cost_slice_cud_per_1m_usd": round(output_cost_slice_cud, 4),
+                "output_cost_slice_dws_per_1m_usd": round(output_cost_slice_dws, 4),
             }
             fout.write(json.dumps(res) + "\n")
 
@@ -353,6 +425,8 @@ def run_one_case(
         overall_throughput,
         last_gen_throughput,
         acc_length,
+        prefix_cache_hit_rate,
+        num_chips,
         profile_link if profile else None,
     )
 
@@ -454,13 +528,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         return
 
     summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
+    summary += "| batch size | latency (s) | ttft (s) | input throughput (tok/s) | output throughput (tok/s) | acc length | ITL (ms) | cache hit % | input cost ($/1M) | output cost ($/1M) | slice CUD out ($/1M) |"
 
     if bench_args.profile:
         summary += " profile |"
 
     summary += "\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
+    summary += "| ---------- | ----------- | -------- | ------------------------ | ------------------------- | ---------- | -------- | ----------- | ----------------- | ------------------ | -------------------- |"
 
     if bench_args.profile:
         summary += "-------------|"
@@ -475,20 +549,30 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         overall_throughput,
         last_gen_throughput,
         acc_length,
+        prefix_cache_hit_rate,
+        num_chips,
         trace_link,
     ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
+        hourly_cost = bench_args.chip_hourly_cost
+        slice_hourly_cost = (
+            bench_args.cluster_hourly_cost
+            if bench_args.cluster_hourly_cost > 0
+            else hourly_cost * num_chips
+        )
         input_util = 0.7
         accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
         line = (
             f"| {batch_size} | "
             f"{latency:.2f} | "
+            f"{ttft:.2f} | "
             f"{input_throughput:.2f} | "
             f"{output_throughput:.2f} | "
             f"{accept_length} | "
             f"{1 / (output_throughput / batch_size) * 1000:.2f} | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
+            f"{prefix_cache_hit_rate * 100:.1f}% | "
+            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.3f} | "
+            f"{1e6 / output_throughput / 3600 * hourly_cost:.3f} | "
+            f"{1e6 / output_throughput / 3600 * slice_hourly_cost:.2f} |"
         )
         if trace_link:
             line += f" [Profile]({trace_link}) |"
