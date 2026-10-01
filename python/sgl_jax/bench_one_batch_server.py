@@ -17,8 +17,10 @@ import itertools
 import json
 import multiprocessing
 import os
+import random
 import time
 
+import numpy as np
 import requests
 
 from sgl_jax.bench_serving import (
@@ -175,6 +177,9 @@ def run_one_case(
     # Determine whether to use text or input_ids based on API type
     return_text = api_type == "openai"
     is_warmup = (run_name == "")
+    case_seed = (getattr(bench_args, "seed", 1) if bench_args is not None else 1) + int(batch_size)
+    random.seed(case_seed)
+    np.random.seed(case_seed)
 
     if (
         not is_warmup
