@@ -477,8 +477,7 @@ class MLAAttentionBackend(AttentionBackend):
         total_loc_len = len(batch.cache_loc)
         per_dp_loc_len = total_loc_len // batch.dp_size
         cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
-        strided_2d = cache_loc_2d[:, :: self.page_size]
-        metadata.page_indices = (strided_2d // self.page_size).ravel()
+        strided_2d = cache_loc_2d[:, :: self.page_size].copy()
 
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
@@ -488,8 +487,7 @@ class MLAAttentionBackend(AttentionBackend):
         cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
         metadata.cu_kv_lens = cu_kv_2d.ravel()
 
-        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, per_dp_bs)
-        metadata.seq_lens = seq_lens_2d.ravel()
+        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, per_dp_bs).copy()
 
         local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
@@ -499,6 +497,28 @@ class MLAAttentionBackend(AttentionBackend):
                 [np.zeros_like(local_num_seqs), np.zeros_like(local_num_seqs), local_num_seqs]
             ).ravel()
         metadata.distribution = distribution
+
+        coop_chunk = int(ext_2d[0, 0]) if batch.forward_mode == ForwardMode.EXTEND else 0
+        if (
+            batch.forward_mode == ForwardMode.EXTEND
+            and batch.dp_size > 1
+            and per_dp_bs >= 2
+            and coop_chunk >= 1024
+            and coop_chunk % self.page_size == 0
+            and seq_lens_2d[0, 0] >= coop_chunk
+            and np.all(ext_2d[:, 0] == coop_chunk)
+            and np.all(seq_lens_2d[:, 1:] == 0)
+            and np.all(
+                seq_lens_2d[:, 0]
+                == seq_lens_2d[0, 0] + np.arange(batch.dp_size, dtype=np.int32) * coop_chunk
+            )
+        ):
+            pos_base = int(seq_lens_2d[0, 0]) - coop_chunk
+            strided_2d[:] = strided_2d[-1:]
+            seq_lens_2d[:, -1] = -(pos_base + 1)
+
+        metadata.page_indices = (strided_2d // self.page_size).ravel()
+        metadata.seq_lens = seq_lens_2d.ravel()
 
         (
             metadata.cu_q_lens,

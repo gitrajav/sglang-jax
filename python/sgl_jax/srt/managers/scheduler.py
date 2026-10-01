@@ -2183,7 +2183,9 @@ class Scheduler(
                 self.process_input_requests(ready_reqs)
 
             coop_target_len = st["coop_target_len"]
-            shared_tokens = st["shared_token_ids"][:coop_target_len]
+            is_eagle_cache = getattr(self.tree_cache, "is_eagle", False)
+            key_token_len = coop_target_len + 1 if is_eagle_cache else coop_target_len
+            shared_tokens = st["shared_token_ids"][:key_token_len]
             extra_key = st["extra_key"]
             full_kv_indices = st["full_kv_indices"]
             try:
@@ -2264,13 +2266,16 @@ class Scheduler(
             lcp_len = max(0, len(ids0) - coop_chunk_tmp)
 
         coop_chunk = int(self.chunked_prefill_size or 1024)
-        coop_target_len = (lcp_len // self.page_size) * self.page_size
+        is_eagle_cache = getattr(self.tree_cache, "is_eagle", False)
+        effective_lcp_len = max(0, lcp_len - 1) if is_eagle_cache else lcp_len
+        coop_target_len = (effective_lcp_len // self.page_size) * self.page_size
         if coop_target_len < 4096:
             return None
 
         extra_key = first_req.extra_key
+        key_token_len = coop_target_len + 1 if is_eagle_cache else coop_target_len
         cached_per_rank = [
-            getattr(self, "_lookup_prefix_length", getattr(self, "_cached_prefix_len", None))(ids0[:coop_target_len], extra_key, r)
+            getattr(self, "_lookup_prefix_length", getattr(self, "_cached_prefix_len", None))(ids0[:key_token_len], extra_key, r)
             for r in range(self.dp_size)
         ]
         min_cached = min(cached_per_rank)
@@ -2339,8 +2344,9 @@ class Scheduler(
             full_kv_indices,
         )
 
-        pad_len = max(0, total_coop_end - len(ids0))
-        shared_token_ids = list(ids0[:total_coop_end]) + ([0] * pad_len)
+        min_shared_len = max(total_coop_end, key_token_len)
+        pad_len = max(0, min_shared_len - len(ids0))
+        shared_token_ids = list(ids0[:min_shared_len]) + ([0] * pad_len)
 
         self._coop_prefill_state = {
             "cur_pos": 0,
@@ -2908,7 +2914,11 @@ class Scheduler(
                 )
             ):
                 if self.enable_overlap:
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+                        if launch_done is not None:
+                            launch_done.wait()
+                    else:
+                        self.tp_worker.resolve_last_batch_result(launch_done)
                     self.set_next_batch_sampling_info_done(batch)
                 return
             if self.pd:
