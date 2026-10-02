@@ -1476,7 +1476,10 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         embed = self.embed_tokens(forward_batch.input_ids)
         hidden_in = forward_batch.spec_info.hidden_states
         emb_sh = jax.typeof(embed).sharding
-        if isinstance(emb_sh, jax.sharding.NamedSharding):
+        if (
+            isinstance(emb_sh, jax.sharding.NamedSharding)
+            and jax.typeof(hidden_in).sharding != emb_sh
+        ):
             hidden_in = jax.sharding.reshard(hidden_in, emb_sh)
 
         concat_in = jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)

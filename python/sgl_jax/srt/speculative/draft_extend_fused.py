@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
@@ -26,6 +27,30 @@ from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
 )
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
+
+_HIDDEN_RELAY_ENV = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY")
+_RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "1") != "0"
+
+
+def _chained_relay(num_steps: int, num_blocks: int) -> bool:
+    if _HIDDEN_RELAY_ENV is not None:
+        return _HIDDEN_RELAY_ENV.strip() not in ("", "0", "false", "False")
+    return False
+
+
+def _spec_decode_compiler_options():
+    if jax.default_backend() != "tpu" or not get_bool_env_var(
+        "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD", "true"
+    ):
+        return None
+    return {
+        "xla_tpu_offload_gather_to_sparsecore": "false",
+        "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+    }
+
+
+_SPEC_DECODE_COMPILER_OPTIONS = _spec_decode_compiler_options()
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -515,12 +540,37 @@ def _topk1_index_from_logits(logits):
     return topk_idx
 
 
+def _auto_sharded(fn, out_like):
+    sharding = jax.typeof(out_like).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        return jax.sharding.auto_axes(fn, out_sharding=sharding)
+    return fn
+
+
+def _rotate_hidden(hidden, ext_lens, sel_pos, prev_out_hidden):
+    """Hidden-state relay for draft step j >= 1 of the single-layer MTP chain."""
+    bs = ext_lens.shape[0]
+    tokens_per_req = hidden.shape[0] // bs
+
+    def _rot(hidden, ext_lens, sel_pos, prev):
+        h2 = hidden.reshape(bs, tokens_per_req, -1)
+        p2 = prev.reshape(bs, tokens_per_req, -1)
+        shifted = jnp.concatenate([h2[:, 1:], h2[:, -1:]], axis=1)
+        rows = jnp.arange(bs)
+        shifted = shifted.at[rows, sel_pos].set(p2[rows, sel_pos])
+        pad_mask = (ext_lens == 0)[:, None, None]
+        return jnp.where(pad_mask, h2, shifted).reshape(hidden.shape)
+
+    return _auto_sharded(_rot, hidden)(hidden, ext_lens, sel_pos, prev_out_hidden)
+
+
 def _build_draft_extend(num_layers: int, topk: int):
     """Build the fused JIT. Called once, result cached on draft_worker."""
     assert topk == 1, "Fused draft extend only supports topk=1"
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["all_memory_pools"],
         static_argnames=["model_state_def", "num_layers", "update_relay", "dp_size"],
     )
@@ -567,19 +617,25 @@ def _build_draft_extend(num_layers: int, topk: int):
                 dp_size=dp_size,
             )
 
+        step_hidden = target_hidden
+        positions0 = forward_batch.positions
+        relay_on = _chained_relay(num_layers, len(all_leaves))
         for i in range(num_layers):
             leaf_idx = i if i < len(all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[leaf_idx])
             model = nnx.merge(model_def, state)
 
-            forward_batch.spec_info.hidden_states = target_hidden
+            forward_batch.spec_info.hidden_states = step_hidden
             forward_batch.input_ids = input_ids
+            if relay_on and _RELAY_POS and i > 0:
+                forward_batch.positions = positions0 + i
 
             output, pool_updates, _, _ = model(
                 forward_batch, all_memory_pools[pool_idx], logits_metadata
             )
-            all_pool_updates.append(pool_updates)
+            if i < len(all_memory_pools):
+                all_pool_updates.append(pool_updates)
 
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else None
@@ -593,7 +649,12 @@ def _build_draft_extend(num_layers: int, topk: int):
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
+                if relay_on:
+                    step_hidden = _rotate_hidden(
+                        step_hidden, ext_lens, sel_pos, output.hidden_states
+                    )
 
+        forward_batch.positions = positions0
         last_idx = draft_logits_indices
         if logits_metadata.accept_lens is not None:
             last_idx = last_idx - (forward_batch.extend_seq_lens - logits_metadata.accept_lens)
@@ -616,7 +677,7 @@ def _build_draft_extend(num_layers: int, topk: int):
         # Force P() replicated sharding only on outputs that may still be
         # materialized on host by the debug/legacy restore path. Relay buffers
         # are DP-local and must be updated with the original data-sharded values.
-        if mesh is not None:
+        if mesh is not None and not update_relay:
             rep = NamedSharding(mesh, P())
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
             stacked_idx = jax.sharding.reshard(stacked_idx, rep)
@@ -1120,6 +1181,7 @@ def _build_verify(topk: int):
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["target_memory_pools"],
         static_argnames=[
             "target_model_state_def",
@@ -1336,24 +1398,11 @@ def _build_verify(topk: int):
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             data = NamedSharding(mesh, P("data"))
-            (
-                prepared_hidden,
-                prepared_verified_id,
-                prepared_new_seq_lens,
-                prepared_accept_lens_host,
-                prepared_sel_pos,
-                prepared_predict,
-                prepared_positions,
-            ) = _reshard_values(
-                rep,
-                prepared_hidden,
-                prepared_verified_id,
-                prepared_new_seq_lens,
-                prepared_accept_lens_host,
-                prepared_sel_pos,
-                prepared_predict,
-                prepared_positions,
+            hidden_data = NamedSharding(
+                mesh, P("data", *([None] * (prepared_hidden.ndim - 1)))
             )
+            if jax.typeof(prepared_hidden).sharding != hidden_data:
+                prepared_hidden = jax.sharding.reshard(prepared_hidden, hidden_data)
             (
                 prepared_verified_id_data,
                 prepared_next_verified_id,
@@ -1376,6 +1425,31 @@ def _build_verify(topk: int):
                 prepared_positions_data,
                 prepared_allocate_lens_data,
             )
+            (
+                prepared_new_seq_lens,
+                prepared_accept_lens_host,
+                prepared_predict,
+            ) = _reshard_values(
+                rep,
+                prepared_new_seq_lens,
+                prepared_accept_lens_host,
+                prepared_predict,
+            )
+            if use_relay_state or rebuild_verify_metadata:
+                prepared_verified_id = prepared_verified_id_data
+                prepared_sel_pos = prepared_sel_pos_data
+                prepared_positions = prepared_positions_data
+            else:
+                (
+                    prepared_verified_id,
+                    prepared_sel_pos,
+                    prepared_positions,
+                ) = _reshard_values(
+                    rep,
+                    prepared_verified_id,
+                    prepared_sel_pos,
+                    prepared_positions,
+                )
             if return_target_logits:
                 target_logits_for_host = jax.sharding.reshard(target_logits_for_host, rep)
 

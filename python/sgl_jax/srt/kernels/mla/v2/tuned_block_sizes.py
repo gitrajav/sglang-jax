@@ -461,12 +461,16 @@ for _k, _dst in TUNED_BLOCK_SIZES_MLA.items():
             _k256 = _tk[:6] + (256, _tk[7])
             _dst.setdefault(_k256, (max(1, _tv[0] // 2),) + _tv[1:])
     _dst[("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 2)] = (4, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 128)] = (8, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 256)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 512)] = (8, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1024)] = (8, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2048)] = (8, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4096)] = (8, 1, 2)
     _dst[("mixed", "bfloat16", "bfloat16", 64, 512, 64, 256, 2)] = (2, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 128)] = (4, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 256)] = (4, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 512)] = (4, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 1024)] = (4, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 2048)] = (4, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 4096)] = (4, 1, 2)
@@ -478,6 +482,13 @@ for _k, _dst in TUNED_BLOCK_SIZES_MLA.items():
                     _v_fp8 = (_tv[0] * 2,) + _tv[1:]
                 elif _tk[0] == "decode" and _tk[6] == 128 and _tk[7] == 2:
                     _v_fp8 = (8, 1, 1)
+                elif (
+                    _tk[0] == "mixed"
+                    and _tk[3] == 64
+                    and _tk[6] == 128
+                    and _tk[7] >= 256
+                ):
+                    _v_fp8 = (16, 32)
                 else:
                     _v_fp8 = _tv
                 _dst[_k_fp8] = _v_fp8

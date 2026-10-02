@@ -736,23 +736,62 @@ class TokenizerManager:
             ):
                 # Tokenize prompts in parallel across worker threads (Rust tokenizers
                 # releases the GIL) while streaming each request to the scheduler in
-                # index order as soon as it finishes, so request 0/1 start CoopPrefill
-                # immediately and the rest arrive well before CoopPrefill completes.
-                futs = [
-                    self._tokenize_executor.submit(self.tokenizer, obj.text[i])
-                    for i in range(batch_size)
-                ]
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    encoded = await asyncio.wrap_future(futs[i])
-                    input_ids = encoded["input_ids"]
-                    self._validate_one_request(tmp_obj, input_ids)
-                    tokenized_obj = self._create_tokenized_object(
-                        tmp_obj, tmp_obj.text, input_ids, None
-                    )
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
-                    rids.append(tmp_obj.rid)
+                # index order as soon as it finishes. When prompts share a long common
+                # prefix, tokenize the prefix once and verify boundary exactness on
+                # prompt 0 before reusing it across the batch.
+                texts = obj.text
+                cp = (
+                    os.path.commonprefix(texts)
+                    if isinstance(texts, list) and all(isinstance(t, str) for t in texts)
+                    else ""
+                )
+                cut = cp.rfind(" ", 0, max(0, len(cp) - 128)) if len(cp) >= 4096 else -1
+                if cut >= 2048:
+                    f_full0 = self._tokenize_executor.submit(self.tokenizer, texts[0])
+                    f_pref = self._tokenize_executor.submit(self.tokenizer, texts[0][:cut])
+                    f_sufs = [
+                        self._tokenize_executor.submit(
+                            self.tokenizer, texts[i][cut:], add_special_tokens=False
+                        )
+                        for i in range(batch_size)
+                    ]
+                    full0 = (await asyncio.wrap_future(f_full0))["input_ids"]
+                    pref_ids = (await asyncio.wrap_future(f_pref))["input_ids"]
+                    suf0 = (await asyncio.wrap_future(f_sufs[0]))["input_ids"]
+                    if pref_ids + suf0 == full0:
+                        for i in range(batch_size):
+                            tmp_obj = obj[i]
+                            suf_i = (
+                                suf0
+                                if i == 0
+                                else (await asyncio.wrap_future(f_sufs[i]))["input_ids"]
+                            )
+                            input_ids = full0 if i == 0 else (pref_ids + suf_i)
+                            self._validate_one_request(tmp_obj, input_ids)
+                            tokenized_obj = self._create_tokenized_object(
+                                tmp_obj, tmp_obj.text, input_ids, None
+                            )
+                            state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                            generators.append(self._wait_one_response(tmp_obj, state, request))
+                            rids.append(tmp_obj.rid)
+                    else:
+                        cut = -1
+                if cut < 2048:
+                    futs = [
+                        self._tokenize_executor.submit(self.tokenizer, obj.text[i])
+                        for i in range(batch_size)
+                    ]
+                    for i in range(batch_size):
+                        tmp_obj = obj[i]
+                        encoded = await asyncio.wrap_future(futs[i])
+                        input_ids = encoded["input_ids"]
+                        self._validate_one_request(tmp_obj, input_ids)
+                        tokenized_obj = self._create_tokenized_object(
+                            tmp_obj, tmp_obj.text, input_ids, None
+                        )
+                        state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                        generators.append(self._wait_one_response(tmp_obj, state, request))
+                        rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 for i in range(batch_size):

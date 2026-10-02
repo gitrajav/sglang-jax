@@ -2163,8 +2163,8 @@ class Scheduler(
             # Cooperative prefill completed! Drain any remaining tokenized requests
             # from tokenizer_manager in lockstep across all nodes.
             empty_polls = 0
-            for _ in range(25):
-                if empty_polls >= 2:
+            for _ in range(80):
+                if len(self.waiting_queue) >= self.dp_size or empty_polls >= 25:
                     break
                 if self.node_rank == 0:
                     time.sleep(0.01)
