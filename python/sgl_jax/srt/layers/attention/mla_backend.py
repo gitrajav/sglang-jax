@@ -318,7 +318,12 @@ class MLAAttentionBackend(AttentionBackend):
         new_kv_c = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
         new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
         dpa = self.attention_data_partition_axis
-        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
+        k_pe_sharding = (
+            NamedSharding(self.mesh, P(dpa, None)) if self.mesh is not None else P(dpa, None)
+        )
+        if jax.typeof(new_k_pe).sharding != k_pe_sharding:
+            new_k_pe = jax.sharding.reshard(new_k_pe, k_pe_sharding)
+        skip_decode = forward_batch.forward_mode != ForwardMode.DECODE
         ql_nope = q
         q_pe = q_rope
         has_tensor_axis = self.mesh is not None and "tensor" in self.mesh.axis_names
@@ -417,6 +422,7 @@ class MLAAttentionBackend(AttentionBackend):
                 num_queries_per_block=self.num_queries_per_block,
                 decode_batch_size=self.decode_batch_size,
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                skip_decode=skip_decode,
             )
 
         o_latent, updated_cache = jax.shard_map(

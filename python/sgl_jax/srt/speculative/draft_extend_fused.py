@@ -532,7 +532,12 @@ def _gather_rows_preserve_sharding(values, index):
 
 
 def _reshard_values(sharding, *values):
-    return tuple(jax.sharding.reshard(value, sharding) for value in values)
+    return tuple(
+        value
+        if jax.typeof(value).sharding == sharding
+        else jax.sharding.reshard(value, sharding)
+        for value in values
+    )
 
 
 def _topk1_index_from_logits(logits):
@@ -1379,11 +1384,6 @@ def _build_verify(topk: int):
             jnp.zeros_like(target_forward_batch.seq_lens),
         ).astype(jnp.int32)
         _extend_lens_2d = prepared_extend_seq_lens.reshape(dp_size, target_bs // dp_size)
-        _ext_sh = jax.typeof(_extend_lens_2d).sharding
-        if isinstance(_ext_sh, NamedSharding) and not _ext_sh.mesh.empty:
-            _extend_lens_2d = jax.sharding.reshard(
-                _extend_lens_2d, NamedSharding(_ext_sh.mesh, P())
-            )
         prepared_logits_indices = (jnp.cumsum(_extend_lens_2d, axis=1).reshape(-1) - 1).astype(
             jnp.int32
         )

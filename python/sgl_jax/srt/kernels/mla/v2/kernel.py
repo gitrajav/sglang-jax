@@ -1343,6 +1343,7 @@ def prepare_outputs(
         "vmem_limit_bytes",
         "decode_batch_size",
         "debug_mode",
+        "skip_decode",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1375,6 +1376,7 @@ def mla_ragged_paged_attention(
     decode_batch_size: int = 1,
     # Debug params.
     debug_mode: bool = False,
+    skip_decode: bool = False,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
     jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128) + align_to(r_dim, 128)]
@@ -1694,46 +1696,48 @@ def mla_ragged_paged_attention(
             cache_kv,
         )
 
-    batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
-    # Batched decode
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        cache_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=batch_distribution,
-        static_q_len=1,
-        batch_size=decode_batch_size,
-        case=MlaCase.BATCHED_DECODE,
-    )
+    updated_kv = cache_kv
+    if not skip_decode:
+        batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+        # Batched decode
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=batch_distribution,
+            static_q_len=1,
+            batch_size=decode_batch_size,
+            case=MlaCase.BATCHED_DECODE,
+        )
 
-    # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=batch_distribution,
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        batch_size=1,
-        case=MlaCase.DECODE,
-    )
+        # Decode-only
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            case=MlaCase.DECODE,
+        )
     # TODO: evaluate if chunk-prefill-only branch is needed
 
     # Mixed

@@ -37,6 +37,98 @@ _MOE_FUSED_DEBUG = os.environ.get("SGL_MOE_FUSED_DEBUG", "0") == "1"
 _MOE_CHUNK_STAGE = int(os.environ.get("SGL_MOE_CHUNK_STAGE", "4") or "4")
 
 
+def _ranged_swiglu(
+    w0: jax.Array,
+    w1: jax.Array,
+    token_start: jax.Array,
+    token_end: jax.Array,
+    block_m: int = 1024,
+) -> jax.Array:
+    """Compute silu(w0) * w1 in-place on rows [token_start, token_end) aligned to block_m."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    m, n = w0.shape
+    num_blocks = m // block_m
+    bounds = jnp.stack(
+        [token_start.reshape(()), token_end.reshape(())]
+    ).astype(jnp.int32)
+
+    def _kernel(
+        bounds_ref,
+        w0_hbm_ref,
+        w1_hbm_ref,
+        out_hbm_ref,
+        w0_vmem_ref,
+        w1_vmem_ref,
+        out_vmem_ref,
+        sem_ref,
+    ):
+        t_start = bounds_ref[0]
+        t_end = bounds_ref[1]
+        b_start = jnp.clip(t_start // block_m, 0, num_blocks)
+        b_end = jnp.clip(pl.cdiv(t_end, block_m), 0, num_blocks)
+
+        def body(b_idx, _):
+            row_offset = b_idx * block_m
+            in_sem = sem_ref.at[0]
+            out_sem = sem_ref.at[1]
+            cp0 = pltpu.make_async_copy(
+                w0_hbm_ref.at[pl.ds(row_offset, block_m)],
+                w0_vmem_ref,
+                in_sem,
+            )
+            cp1 = pltpu.make_async_copy(
+                w1_hbm_ref.at[pl.ds(row_offset, block_m)],
+                w1_vmem_ref,
+                in_sem,
+            )
+            cp0.start()
+            cp1.start()
+            cp0.wait()
+            cp1.wait()
+
+            out_vmem_ref[...] = jnp.multiply(
+                jax.nn.silu(w0_vmem_ref[...]), w1_vmem_ref[...]
+            )
+
+            cpo = pltpu.make_async_copy(
+                out_vmem_ref,
+                out_hbm_ref.at[pl.ds(row_offset, block_m)],
+                out_sem,
+            )
+            cpo.start()
+            cpo.wait()
+
+        jax.lax.fori_loop(b_start, b_end, body, None)
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM((block_m, n), w0.dtype),
+                pltpu.VMEM((block_m, n), w1.dtype),
+                pltpu.VMEM((block_m, n), w0.dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+        ),
+        out_shape=jax.ShapeDtypeStruct(w0.shape, w0.dtype),
+        input_output_aliases={1: 0},
+        name="moe_ranged_swiglu",
+    )(bounds, w0, w1)
+
+
 class EPMoE(nnx.Module):
     def __init__(
         self,
@@ -481,11 +573,30 @@ class EPMoE(nnx.Module):
             scatter_on_expert = False
             scatter_on_tensor = "tensor" in out_specs
 
+        _pack_routing = (
+            topk_weights.dtype == jnp.float32
+            and topk_ids.dtype == jnp.int32
+            and topk_weights.shape == topk_ids.shape
+        )
+        if _pack_routing:
+            packed_routing = jnp.concatenate(
+                [jax.lax.bitcast_convert_type(topk_weights, jnp.int32), topk_ids],
+                axis=-1,
+            )
+
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
-            topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
-            topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
+            if _pack_routing:
+                packed_reshard = jax.sharding.reshard(packed_routing, P(None))
+                k_top = topk_ids.shape[-1]
+                topk_weights_reshard = jax.lax.bitcast_convert_type(
+                    packed_reshard[..., :k_top], jnp.float32
+                )
+                topk_ids_reshard = packed_reshard[..., k_top:]
+            else:
+                topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
+                topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
             # Normalize scales to GMM's 4D layout [E, k_blocks, 1, out_dim]
             w0_scale = self._normalize_scale_for_gmm(
@@ -812,13 +923,28 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
-        elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+        if (
+            self.activation == "silu"
+            and use_fused
+            and self.ep_size > 1
+            and token_start is not None
+            and token_end is not None
+            and layer_w0.ndim == 2
+            and layer_w0.shape[0] >= 4096
+            and layer_w0.shape[0] % 1024 == 0
+            and layer_w0.shape[1] % 128 == 0
+        ):
+            intermediate_layer = _ranged_swiglu(
+                layer_w0, layer_w1, token_start, token_end
+            )
         else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
+            if self.activation == "silu":
+                layer_act = jax.nn.silu(layer_w0)
+            elif self.activation == "gelu":
+                layer_act = jax.nn.gelu(layer_w0)
+            else:
+                raise ValueError(f"Unsupported activation function {self.activation}")
+            intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
         # When use_fused is True and ep_size > 1, ragged_gather_reduce_v2 masks
