@@ -2383,7 +2383,7 @@ class Scheduler(
         """
         budget_ms = getattr(self, "_prefill_coalesce_ms", None)
         if budget_ms is None:
-            budget_ms = float(os.environ.get("SGL_PREFILL_COALESCE_MS", "60") or 0)
+            budget_ms = float(os.environ.get("SGL_PREFILL_COALESCE_MS", "400") or 0)
             self._prefill_coalesce_ms = budget_ms
         if budget_ms <= 0 or not self.waiting_queue or not self.running_batch.is_empty():
             return
@@ -2395,9 +2395,13 @@ class Scheduler(
 
         poll_s = 0.005
         max_polls = max(1, int(budget_ms / (poll_s * 1000)))
+        # A burst of long prompts arrives at tokenizer speed (tens of ms apart),
+        # so wait out short gaps while the queue is still growing and stop only
+        # after a longer quiet period.
+        quiet_limit = 6
         quiet_polls = 0
         for _ in range(max_polls):
-            if len(self.waiting_queue) >= capacity or quiet_polls >= 2:
+            if len(self.waiting_queue) >= capacity or quiet_polls >= quiet_limit:
                 break
             if self.node_rank == 0:
                 time.sleep(poll_s)
