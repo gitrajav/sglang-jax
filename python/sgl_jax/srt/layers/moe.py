@@ -577,6 +577,7 @@ class EPMoE(nnx.Module):
             topk_weights.dtype == jnp.float32
             and topk_ids.dtype == jnp.int32
             and topk_weights.shape == topk_ids.shape
+            and hidden_states.shape[0] >= 512
         )
         if _pack_routing:
             packed_routing = jnp.concatenate(

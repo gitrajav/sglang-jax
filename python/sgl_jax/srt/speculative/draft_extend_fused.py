@@ -494,7 +494,10 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
-        ext_rank_cumsum = jnp.cumsum(ext_rank, axis=0)
+        N = ext_rank.shape[0]
+        idx = jnp.arange(N)
+        mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
+        ext_rank_cumsum = jnp.dot(mask, ext_rank)
 
         starts = ext_rank_cumsum - ext_rank
         ends = starts + ext_rank
@@ -502,14 +505,21 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
 
-        req_starts = jnp.take(starts, slot)
-        req_lens = jnp.take(ext_rank, slot)
-        req_verified = jnp.take(verified_rank, slot)
+        one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
+        req_starts = jnp.dot(one_hot_slot, starts)
+        req_lens = jnp.dot(one_hot_slot, ext_rank)
+        req_verified = jnp.dot(one_hot_slot, verified_rank)
 
-        shifted = jnp.concatenate([ids_rank[1:], ids_rank[-1:]], axis=0)
+        shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
+        one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
+        shifted = jnp.dot(one_hot_shifted, ids_rank)
 
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
-        return jnp.where(has_req, jnp.where(is_last, req_verified, shifted), ids_rank)
+        is_last_int = is_last.astype(jnp.int32)
+        rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
+
+        has_req_int = has_req.astype(jnp.int32)
+        return has_req_int * rotated + (1 - has_req_int) * ids_rank
 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
@@ -1411,6 +1421,11 @@ def _build_verify(topk: int):
             jnp.zeros_like(target_forward_batch.seq_lens),
         ).astype(jnp.int32)
         _extend_lens_2d = prepared_extend_seq_lens.reshape(dp_size, target_bs // dp_size)
+        _ext_sh = jax.typeof(_extend_lens_2d).sharding
+        if isinstance(_ext_sh, NamedSharding) and not _ext_sh.mesh.empty:
+            _extend_lens_2d = jax.sharding.reshard(
+                _extend_lens_2d, NamedSharding(_ext_sh.mesh, P())
+            )
         prepared_logits_indices = (jnp.cumsum(_extend_lens_2d, axis=1).reshape(-1) - 1).astype(
             jnp.int32
         )

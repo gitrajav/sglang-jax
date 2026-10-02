@@ -197,8 +197,16 @@ def build_bigram_radix_key(req: Req, key_len: int, start: int = 0) -> RadixKey:
     bigrams of the prefix already converted and only extends them.
     """
     key_sequence = req.radix_input_ids + req.output_ids if req.output_ids else req.radix_input_ids
-    cache = getattr(req, "_radix_bigram_cache", None)
     need = max(0, key_len - 1)
+    if start > 0:
+        if start >= need:
+            return RadixKey([], req.extra_key, req.dp_rank)
+        return RadixKey(
+            list(zip(key_sequence[start:need], key_sequence[start + 1 : need + 1])),
+            req.extra_key,
+            req.dp_rank,
+        )
+    cache = getattr(req, "_radix_bigram_cache", None)
     if cache is None or cache[0] > len(key_sequence) or (
         cache[0] > 0 and key_sequence[cache[0] - 1] != cache[2]
     ):
