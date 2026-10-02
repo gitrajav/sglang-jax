@@ -2238,18 +2238,18 @@ class Scheduler(
                 last_shared_tok = shared_tokens[-1]
                 for wreq in self.waiting_queue:
                     if (
-                        len(wreq.radix_input_ids) >= key_token_len
+                        getattr(wreq, "_radix_bigram_cache", None) is None
+                        and len(wreq.radix_input_ids) >= key_token_len
                         and wreq.radix_input_ids[key_token_len - 1] == last_shared_tok
                         and wreq.radix_input_ids[:key_token_len] == shared_tokens
                     ):
+                        wreq._radix_bigram_cache = (
+                            key_token_len,
+                            list(converted_shared),
+                            last_shared_tok,
+                        )
                         if wreq.dp_rank in coop_match_by_rank:
                             wreq._coop_prematched_result = coop_match_by_rank[wreq.dp_rank]
-                        elif getattr(wreq, "_radix_bigram_cache", None) is None:
-                            wreq._radix_bigram_cache = (
-                                key_token_len,
-                                list(converted_shared),
-                                last_shared_tok,
-                            )
 
             logger.info(
                 "[CoopPrefill] Global RadixCache populated across all %d DP ranks: "

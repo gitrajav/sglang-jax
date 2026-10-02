@@ -1287,15 +1287,9 @@ class ScheduleBatch:
 
                 if pre_len > 0:
                     # Slice: same P-thread race on prefix_indices as above.
-                    dst_row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :pre_len]
-                    src_prefix = req.prefix_indices[:pre_len]
-                    if (
-                        not isinstance(src_prefix, np.ndarray)
-                        or dst_row.ctypes.data != src_prefix.ctypes.data
-                    ):
-                        self.req_to_token_pool.write(
-                            (req.req_pool_idx, slice(0, pre_len)), src_prefix
-                        )
+                    self.req_to_token_pool.write(
+                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices[:pre_len]
+                    )
 
                 req.cached_tokens += pre_len - req.already_computed
                 req.already_computed = seq_len

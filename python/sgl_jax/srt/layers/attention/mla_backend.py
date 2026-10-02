@@ -532,47 +532,26 @@ class MLAAttentionBackend(AttentionBackend):
             pos_base = int(seq_lens_2d[0, 0]) - coop_chunk
             seq_lens_2d[:, -1] = -(pos_base + 1)
 
+        strided_2d = cache_loc_2d[:, :: self.page_size].copy()
+        if is_coop:
+            strided_2d[:] = strided_2d[-1:]
+        metadata.page_indices = (strided_2d // self.page_size).ravel()
         metadata.seq_lens = seq_lens_2d.ravel()
-        pi_cache = getattr(batch, "_mla_eagle_pi_cache", None)
-        pi_key = (getattr(batch, "bid", None), id(batch.cache_loc), len(batch.cache_loc), self.page_size, is_coop)
-        if not is_coop and pi_cache is not None and pi_cache[0] == pi_key:
-            metadata.page_indices = pi_cache[1]
-            (
-                metadata.cu_q_lens,
-                metadata.cu_kv_lens,
-                metadata.seq_lens,
-                metadata.distribution,
-            ) = device_array(
-                (
-                    metadata.cu_q_lens,
-                    metadata.cu_kv_lens,
-                    metadata.seq_lens,
-                    metadata.distribution,
-                ),
-                sharding=(data_sharding),
-            )
-        else:
-            strided_2d = cache_loc_2d[:, :: self.page_size].copy()
-            if is_coop:
-                strided_2d[:] = strided_2d[-1:]
-            metadata.page_indices = (strided_2d // self.page_size).ravel()
+        (
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.page_indices,
+            metadata.seq_lens,
+            metadata.distribution,
+        ) = device_array(
             (
                 metadata.cu_q_lens,
                 metadata.cu_kv_lens,
                 metadata.page_indices,
                 metadata.seq_lens,
                 metadata.distribution,
-            ) = device_array(
-                (
-                    metadata.cu_q_lens,
-                    metadata.cu_kv_lens,
-                    metadata.page_indices,
-                    metadata.seq_lens,
-                    metadata.distribution,
-                ),
-                sharding=(data_sharding),
-            )
-            if not is_coop:
-                batch._mla_eagle_pi_cache = (pi_key, metadata.page_indices)
+            ),
+            sharding=(data_sharding),
+        )
 
         return metadata
