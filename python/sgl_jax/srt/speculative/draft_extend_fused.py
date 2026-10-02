@@ -1915,7 +1915,6 @@ def prepare_forward_batch_for_prefill(spec_worker, model_worker_batch):
     target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
         model_worker_batch
     )
-    model_worker_batch._prepared_target_attn_metadata = target_mr.attn_backend.forward_metadata
     model_worker_batch.forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     model_worker_batch.forward_batch.bid = model_worker_batch.bid
     # Fused prefill calls the target model directly, bypassing ModelRunner.forward.
@@ -2328,13 +2327,9 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         target_forward_batch = prepare_forward_batch_for_prefill(spec_worker, model_worker_batch)
     else:
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        prepared_meta = getattr(model_worker_batch, "_prepared_target_attn_metadata", None)
-        if prepared_meta is not None:
-            target_mr.attn_backend.forward_metadata = prepared_meta
-        else:
-            target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
-                model_worker_batch
-            )
+        target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
+            model_worker_batch
+        )
         target_forward_batch = model_worker_batch.forward_batch
         target_forward_batch.bid = model_worker_batch.bid
         # Some callers supply an already-built ForwardBatch. Preserve prepared

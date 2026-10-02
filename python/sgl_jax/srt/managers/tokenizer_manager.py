@@ -770,41 +770,23 @@ class TokenizerManager:
                         else:
                             cached_pref = None
                     if cached_pref is None or cached_pref[0] != pref_str:
-                        b_lo_ws = texts[0].rfind(" ", 0, max(0, cut - 256))
-                        if b_lo_ws >= 0 and cut - b_lo_ws <= 512:
-                            b_lo = b_lo_ws
+                        f_full0 = self._tokenize_executor.submit(self.tokenizer, texts[0])
                         f_pref = self._tokenize_executor.submit(self.tokenizer, pref_str)
                         f_tail = self._tokenize_executor.submit(
                             self.tokenizer, texts[0][b_lo:cut], add_special_tokens=False
                         )
-                        f_bound = self._tokenize_executor.submit(
-                            self.tokenizer, texts[0][b_lo:b_hi], add_special_tokens=False
-                        )
+                        suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
                         tail_ids = (await asyncio.wrap_future(f_tail))["input_ids"]
-                        bound_ids = (await asyncio.wrap_future(f_bound))["input_ids"]
                         f_sufs_rest = [
                             self._tokenize_executor.submit(
                                 self.tokenizer, texts[i][cut:], add_special_tokens=False
                             )
                             for i in range(2, batch_size)
                         ]
-                        suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
+                        full0 = (await asyncio.wrap_future(f_full0))["input_ids"]
                         pref_ids = (await asyncio.wrap_future(f_pref))["input_ids"]
-                        n_rhs = len(bound_ids) - len(tail_ids)
-                        if (
-                            len(tail_ids) >= 4
-                            and len(pref_ids) >= len(tail_ids)
-                            and pref_ids[-(len(tail_ids) - 1) :] == tail_ids[1:]
-                            and n_rhs >= 0
-                            and tail_ids[1:] + suf0[:n_rhs] == bound_ids[1:]
-                        ):
-                            full0 = pref_ids + suf0
+                        if pref_ids + suf0 == full0:
                             self._last_prefix_token_cache = (pref_str, pref_ids, tail_ids)
-                        else:
-                            f_full0 = self._tokenize_executor.submit(self.tokenizer, texts[0])
-                            full0 = (await asyncio.wrap_future(f_full0))["input_ids"]
-                            if pref_ids + suf0 == full0:
-                                self._last_prefix_token_cache = (pref_str, pref_ids, tail_ids)
                     else:
                         f_sufs_rest = [
                             self._tokenize_executor.submit(
