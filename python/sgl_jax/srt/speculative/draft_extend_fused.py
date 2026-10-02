@@ -1545,7 +1545,8 @@ def _build_prefill(num_layers: int, topk: int):
         mesh = None
 
         draft_forward_batch.spec_info.hidden_states = target_hidden
-        for i in range(num_layers):
+        num_draft_passes = min(num_layers, len(all_memory_pools))
+        for i in range(num_draft_passes):
             leaf_idx = i if i < len(draft_all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
             state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[leaf_idx])
@@ -1564,7 +1565,7 @@ def _build_prefill(num_layers: int, topk: int):
             all_topk_index.append(topk_idx)
             if i == 0:
                 layer0_hidden = output.hidden_states
-            if i < num_layers - 1:
+            if i < num_draft_passes - 1:
                 input_ids = _rotate_prefill_input_ids(
                     input_ids,
                     draft_forward_batch.extend_seq_lens,
@@ -1572,6 +1573,8 @@ def _build_prefill(num_layers: int, topk: int):
                     dp_size,
                     per_dp_bs,
                 )
+        while len(all_topk_index) < num_layers:
+            all_topk_index.append(all_topk_index[-1])
 
         last_idx = draft_logits_indices
         if dp_size > 1:
