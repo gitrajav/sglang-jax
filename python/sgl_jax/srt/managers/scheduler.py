@@ -2238,18 +2238,18 @@ class Scheduler(
                 last_shared_tok = shared_tokens[-1]
                 for wreq in self.waiting_queue:
                     if (
-                        getattr(wreq, "_radix_bigram_cache", None) is None
-                        and len(wreq.radix_input_ids) >= key_token_len
+                        len(wreq.radix_input_ids) >= key_token_len
                         and wreq.radix_input_ids[key_token_len - 1] == last_shared_tok
                         and wreq.radix_input_ids[:key_token_len] == shared_tokens
                     ):
-                        wreq._radix_bigram_cache = (
-                            key_token_len,
-                            list(converted_shared),
-                            last_shared_tok,
-                        )
                         if wreq.dp_rank in coop_match_by_rank:
                             wreq._coop_prematched_result = coop_match_by_rank[wreq.dp_rank]
+                        elif getattr(wreq, "_radix_bigram_cache", None) is None:
+                            wreq._radix_bigram_cache = (
+                                key_token_len,
+                                list(converted_shared),
+                                last_shared_tok,
+                            )
 
             logger.info(
                 "[CoopPrefill] Global RadixCache populated across all %d DP ranks: "
@@ -2431,7 +2431,11 @@ class Scheduler(
             return
         if any(req is not None for req in self.chunked_reqs):
             return
-        capacity = self.per_dp_max_running_requests * self.dp_size
+        first_len = len(self.waiting_queue[0].origin_input_ids)
+        if self.chunked_prefill_size is not None and first_len > self.chunked_prefill_size:
+            capacity = self.dp_size
+        else:
+            capacity = self.per_dp_max_running_requests * self.dp_size
         if len(self.waiting_queue) >= capacity:
             return
 

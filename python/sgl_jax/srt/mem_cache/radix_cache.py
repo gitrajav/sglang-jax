@@ -197,8 +197,16 @@ def build_bigram_radix_key(req: Req, key_len: int, start: int = 0) -> RadixKey:
     bigrams of the prefix already converted and only extends them.
     """
     key_sequence = req.radix_input_ids + req.output_ids if req.output_ids else req.radix_input_ids
-    cache = getattr(req, "_radix_bigram_cache", None)
     need = max(0, key_len - 1)
+    if start > 0:
+        if start >= need:
+            return RadixKey([], req.extra_key, req.dp_rank)
+        return RadixKey(
+            list(zip(key_sequence[start:need], key_sequence[start + 1 : need + 1])),
+            req.extra_key,
+            req.dp_rank,
+        )
+    cache = getattr(req, "_radix_bigram_cache", None)
     if cache is None or cache[0] > len(key_sequence) or (
         cache[0] > 0 and key_sequence[cache[0] - 1] != cache[2]
     ):
@@ -511,7 +519,17 @@ class RadixCache(BasePrefixCache):
             while cur is not None:
                 cur.last_access_time = now
                 cur = cur.parent
-            new_prefix_len = old_prefix_len + self._insert_helper(last_node, tail_key, tail_val)
+            inserted_match_len = self._insert_helper(last_node, tail_key, tail_val)
+            new_prefix_len = old_prefix_len + inserted_match_len
+            if inserted_match_len == 0 and len(tail_key) > 0:
+                new_last_node = last_node.children[self.get_child_key_fn(tail_key)]
+                req.last_matched_prefix_len = page_aligned_len
+                req.cache_protected_len = page_aligned_len
+                self.dec_lock_ref(req.last_node)
+                self.inc_lock_ref(new_last_node)
+                req.prefix_indices = kv_indices
+                req.last_node = new_last_node
+                return
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
             )

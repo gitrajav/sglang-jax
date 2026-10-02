@@ -448,7 +448,7 @@ class TokenizerManager:
 
         tokenized_obj = TokenizedGenerateReqInput(
             rid=obj.rid,
-            text=input_text,
+            text="" if (mm_inputs is None and input_ids is not None) else input_text,
             input_ids=input_ids,
             radix_input_ids=build_radix_input_ids(input_ids, mm_inputs),
             sampling_params=sampling_params,
@@ -751,18 +751,18 @@ class TokenizerManager:
                     cached_pref = getattr(self, "_last_prefix_token_cache", None)
                     b_lo = max(0, cut - 256)
                     b_hi = min(len(texts[0]), cut + 256)
-                    f_sufs = [
-                        self._tokenize_executor.submit(
-                            self.tokenizer, texts[i][cut:], add_special_tokens=False
-                        )
-                        for i in range(batch_size)
-                    ]
+                    f_suf0 = self._tokenize_executor.submit(
+                        self.tokenizer, texts[0][cut:], add_special_tokens=False
+                    )
+                    f_suf1 = self._tokenize_executor.submit(
+                        self.tokenizer, texts[1][cut:], add_special_tokens=False
+                    )
                     if cached_pref is not None and cached_pref[0] == pref_str:
                         pref_ids, pref_tail_ids = cached_pref[1], cached_pref[2]
                         f_bound = self._tokenize_executor.submit(
                             self.tokenizer, texts[0][b_lo:b_hi], add_special_tokens=False
                         )
-                        suf0 = (await asyncio.wrap_future(f_sufs[0]))["input_ids"]
+                        suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
                         bound_ids = (await asyncio.wrap_future(f_bound))["input_ids"]
                         n_rhs = len(bound_ids) - len(pref_tail_ids)
                         if n_rhs >= 0 and pref_tail_ids + suf0[:n_rhs] == bound_ids:
@@ -778,18 +778,26 @@ class TokenizerManager:
                         full0 = (await asyncio.wrap_future(f_full0))["input_ids"]
                         pref_ids = (await asyncio.wrap_future(f_pref))["input_ids"]
                         tail_ids = (await asyncio.wrap_future(f_tail))["input_ids"]
-                        suf0 = (await asyncio.wrap_future(f_sufs[0]))["input_ids"]
+                        suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
                         if pref_ids + suf0 == full0:
                             self._last_prefix_token_cache = (pref_str, pref_ids, tail_ids)
                     if pref_ids + suf0 == full0:
+                        f_sufs_rest = [
+                            self._tokenize_executor.submit(
+                                self.tokenizer, texts[i][cut:], add_special_tokens=False
+                            )
+                            for i in range(2, batch_size)
+                        ]
                         for i in range(batch_size):
                             tmp_obj = obj[i]
-                            suf_i = (
-                                suf0
-                                if i == 0
-                                else (await asyncio.wrap_future(f_sufs[i]))["input_ids"]
-                            )
-                            input_ids = full0 if i == 0 else (pref_ids + suf_i)
+                            if i == 0:
+                                input_ids = full0
+                            elif i == 1:
+                                suf1 = (await asyncio.wrap_future(f_suf1))["input_ids"]
+                                input_ids = pref_ids + suf1
+                            else:
+                                suf_i = (await asyncio.wrap_future(f_sufs_rest[i - 2]))["input_ids"]
+                                input_ids = pref_ids + suf_i
                             self._validate_one_request(tmp_obj, input_ids)
                             tokenized_obj = self._create_tokenized_object(
                                 tmp_obj, tmp_obj.text, input_ids, None
@@ -797,6 +805,8 @@ class TokenizerManager:
                             state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                             generators.append(self._wait_one_response(tmp_obj, state, request))
                             rids.append(tmp_obj.rid)
+                            if i == 1 and batch_size > 2:
+                                await asyncio.sleep(0)
                     else:
                         cut = -1
                 if cut < 2048:

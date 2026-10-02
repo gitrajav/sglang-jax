@@ -494,7 +494,10 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
-        ext_rank_cumsum = jnp.cumsum(ext_rank, axis=0)
+        N = ext_rank.shape[0]
+        idx = jnp.arange(N)
+        mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
+        ext_rank_cumsum = jnp.dot(mask, ext_rank)
 
         starts = ext_rank_cumsum - ext_rank
         ends = starts + ext_rank
@@ -502,14 +505,21 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
 
-        req_starts = jnp.take(starts, slot)
-        req_lens = jnp.take(ext_rank, slot)
-        req_verified = jnp.take(verified_rank, slot)
+        one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
+        req_starts = jnp.dot(one_hot_slot, starts)
+        req_lens = jnp.dot(one_hot_slot, ext_rank)
+        req_verified = jnp.dot(one_hot_slot, verified_rank)
 
-        shifted = jnp.concatenate([ids_rank[1:], ids_rank[-1:]], axis=0)
+        shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
+        one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
+        shifted = jnp.dot(one_hot_shifted, ids_rank)
 
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
-        return jnp.where(has_req, jnp.where(is_last, req_verified, shifted), ids_rank)
+        is_last_int = is_last.astype(jnp.int32)
+        rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
+
+        has_req_int = has_req.astype(jnp.int32)
+        return has_req_int * rotated + (1 - has_req_int) * ids_rank
 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
@@ -1374,6 +1384,11 @@ def _build_verify(topk: int):
             jnp.zeros_like(target_forward_batch.seq_lens),
         ).astype(jnp.int32)
         _extend_lens_2d = prepared_extend_seq_lens.reshape(dp_size, target_bs // dp_size)
+        _ext_sh = jax.typeof(_extend_lens_2d).sharding
+        if isinstance(_ext_sh, NamedSharding) and not _ext_sh.mesh.empty:
+            _extend_lens_2d = jax.sharding.reshard(
+                _extend_lens_2d, NamedSharding(_ext_sh.mesh, P())
+            )
         prepared_logits_indices = (jnp.cumsum(_extend_lens_2d, axis=1).reshape(-1) - 1).astype(
             jnp.int32
         )
@@ -1581,12 +1596,11 @@ def _build_prefill(num_layers: int, topk: int):
         relay_topk_index = stacked_idx
         relay_verified_id = next_token_ids
         relay_new_seq_lens = target_forward_batch.seq_lens + 1
-        if mesh is not None:
+        if mesh is not None and not update_relay:
             rep = NamedSharding(mesh, P())
             next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), rep)
-            if not update_relay:
-                selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
-                stacked_idx = jax.sharding.reshard(stacked_idx, rep)
+            selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
+            stacked_idx = jax.sharding.reshard(stacked_idx, rep)
 
         updated_relay_buffers = relay_buffers
         if update_relay:
@@ -1809,6 +1823,7 @@ def _make_forward_batch(batch, model_runner):
         lora_token_indices = batch.lora_token_indices
         lora_ranks = batch.lora_ranks
 
+    upload_cache_loc = getattr(model_runner.attn_backend, "needs_device_cache_loc", True)
     return ForwardBatch(
         bid=batch.bid,
         forward_mode=batch.forward_mode,
@@ -1825,7 +1840,11 @@ def _make_forward_batch(batch, model_runner):
         req_pool_indices=_prepare_device_array(
             batch.req_pool_indices, data_sharding, "forward.req_pool_indices"
         ),
-        cache_loc=_prepare_device_array(batch.cache_loc, data_sharding, "forward.cache_loc"),
+        cache_loc=(
+            _prepare_device_array(batch.cache_loc, data_sharding, "forward.cache_loc")
+            if upload_cache_loc
+            else None
+        ),
         extend_prefix_lens=_prepare_device_array(
             batch.extend_prefix_lens, data_sharding, "forward.extend_prefix_lens"
         ),
@@ -2378,7 +2397,10 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         cache_miss_count = count()
     prefill_output_token_ids = None
     if update_relay:
-        prefill_output_token_ids = next_token_ids
+        prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
+            draft_worker,
+            next_token_ids,
+        )
         if hasattr(prefill_output_token_ids, "copy_to_host_async"):
             prefill_output_token_ids.copy_to_host_async()
 

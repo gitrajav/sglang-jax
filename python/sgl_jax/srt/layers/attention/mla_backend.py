@@ -83,6 +83,8 @@ class MLAAttentionMetadata:
 class MLAAttentionBackend(AttentionBackend):
     """Absorbed-MLA attention backend backed by the v2 Pallas kernel."""
 
+    needs_device_cache_loc: bool = False
+
     def __init__(
         self,
         num_attn_heads: int,
@@ -483,7 +485,6 @@ class MLAAttentionBackend(AttentionBackend):
         total_loc_len = len(batch.cache_loc)
         per_dp_loc_len = total_loc_len // batch.dp_size
         cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
-        strided_2d = cache_loc_2d[:, :: self.page_size].copy()
 
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
@@ -505,7 +506,8 @@ class MLAAttentionBackend(AttentionBackend):
         metadata.distribution = distribution
 
         coop_chunk = int(ext_2d[0, 0]) if batch.forward_mode == ForwardMode.EXTEND else 0
-        if (
+        data_sharding = NamedSharding(self.mesh, P(self.attention_data_partition_axis))
+        is_coop = (
             batch.forward_mode == ForwardMode.EXTEND
             and batch.dp_size > 1
             and per_dp_bs >= 2
@@ -518,29 +520,52 @@ class MLAAttentionBackend(AttentionBackend):
                 seq_lens_2d[:, 0]
                 == seq_lens_2d[0, 0] + np.arange(batch.dp_size, dtype=np.int32) * coop_chunk
             )
-        ):
+        )
+        if is_coop:
             pos_base = int(seq_lens_2d[0, 0]) - coop_chunk
-            strided_2d[:] = strided_2d[-1:]
             seq_lens_2d[:, -1] = -(pos_base + 1)
 
-        metadata.page_indices = (strided_2d // self.page_size).ravel()
         metadata.seq_lens = seq_lens_2d.ravel()
-
-        (
-            metadata.cu_q_lens,
-            metadata.cu_kv_lens,
-            metadata.page_indices,
-            metadata.seq_lens,
-            metadata.distribution,
-        ) = device_array(
+        pi_cache = getattr(batch, "_mla_eagle_pi_cache", None)
+        pi_key = (getattr(batch, "bid", None), id(batch.cache_loc), len(batch.cache_loc), self.page_size, is_coop)
+        if not is_coop and pi_cache is not None and pi_cache[0] == pi_key:
+            metadata.page_indices = pi_cache[1]
+            (
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.seq_lens,
+                metadata.distribution,
+            ) = device_array(
+                (
+                    metadata.cu_q_lens,
+                    metadata.cu_kv_lens,
+                    metadata.seq_lens,
+                    metadata.distribution,
+                ),
+                sharding=(data_sharding),
+            )
+        else:
+            strided_2d = cache_loc_2d[:, :: self.page_size].copy()
+            if is_coop:
+                strided_2d[:] = strided_2d[-1:]
+            metadata.page_indices = (strided_2d // self.page_size).ravel()
             (
                 metadata.cu_q_lens,
                 metadata.cu_kv_lens,
                 metadata.page_indices,
                 metadata.seq_lens,
                 metadata.distribution,
-            ),
-            sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
-        )
+            ) = device_array(
+                (
+                    metadata.cu_q_lens,
+                    metadata.cu_kv_lens,
+                    metadata.page_indices,
+                    metadata.seq_lens,
+                    metadata.distribution,
+                ),
+                sharding=(data_sharding),
+            )
+            if not is_coop:
+                batch._mla_eagle_pi_cache = (pi_key, metadata.page_indices)
 
         return metadata

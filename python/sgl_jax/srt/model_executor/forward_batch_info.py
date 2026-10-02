@@ -351,6 +351,7 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        upload_cache_loc = getattr(model_runner.attn_backend, "needs_device_cache_loc", True)
         (
             input_ids,
             seq_lens,
@@ -367,7 +368,7 @@ class ForwardBatch:
                 batch.out_cache_loc,
                 batch.positions,
                 batch.req_pool_indices,
-                batch.cache_loc,
+                batch.cache_loc if upload_cache_loc else None,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),

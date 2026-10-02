@@ -422,6 +422,6 @@ def build_radix_input_ids(
 ) -> list[int]:
     """Build the canonical token identity used by every radix-cache operation."""
     cache_input_ids = build_cache_input_ids(input_ids, mm_inputs)
-    radix_input_ids = cache_input_ids if cache_input_ids is not None else list(input_ids)
+    radix_input_ids = cache_input_ids if cache_input_ids is not None else input_ids
     assert len(radix_input_ids) == len(input_ids)
     return radix_input_ids

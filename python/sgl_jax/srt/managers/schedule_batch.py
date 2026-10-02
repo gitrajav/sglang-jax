@@ -216,7 +216,7 @@ class Req:
         )
         self.origin_input_ids = origin_input_ids
         self.radix_input_ids = (
-            radix_input_ids if radix_input_ids is not None else list(origin_input_ids)
+            radix_input_ids if radix_input_ids is not None else self.origin_input_ids
         )
         assert len(self.origin_input_ids) == len(self.radix_input_ids)
         # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
@@ -1287,9 +1287,15 @@ class ScheduleBatch:
 
                 if pre_len > 0:
                     # Slice: same P-thread race on prefix_indices as above.
-                    self.req_to_token_pool.write(
-                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices[:pre_len]
-                    )
+                    dst_row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :pre_len]
+                    src_prefix = req.prefix_indices[:pre_len]
+                    if (
+                        not isinstance(src_prefix, np.ndarray)
+                        or dst_row.ctypes.data != src_prefix.ctypes.data
+                    ):
+                        self.req_to_token_pool.write(
+                            (req.req_pool_idx, slice(0, pre_len)), src_prefix
+                        )
 
                 req.cached_tokens += pre_len - req.already_computed
                 req.already_computed = seq_len
@@ -2505,11 +2511,14 @@ class ScheduleBatch:
                     flat_src += np.arange(total_pages, dtype=np.int64) * page_size
                     page_starts = req_to_token_flat[flat_src]
                     dest = cache_loc_cpu[offset_bs : offset_bs + total_aligned]
-                    np.add(
-                        page_starts.reshape(total_pages, 1),
-                        page_ramp.reshape(1, page_size),
-                        out=dest.reshape(total_pages, page_size),
-                    )
+                    if getattr(self.model_config, "attention_backend", None) in ("fa", "mla"):
+                        dest.reshape(total_pages, page_size)[:, 0] = page_starts
+                    else:
+                        np.add(
+                            page_starts.reshape(total_pages, 1),
+                            page_ramp.reshape(1, page_size),
+                            out=dest.reshape(total_pages, page_size),
+                        )
             else:
                 # Non-paged allocator has no page-contiguity guarantee.
                 for r in range(n_reqs):

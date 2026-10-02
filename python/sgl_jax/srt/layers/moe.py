@@ -88,9 +88,9 @@ def _ranged_swiglu(
             cp0.wait()
             cp1.wait()
 
-            v0_f32 = w0_vmem_ref[...].astype(jnp.float32)
-            act = (v0_f32 * jax.nn.sigmoid(v0_f32)).astype(w0_vmem_ref.dtype)
-            out_vmem_ref[...] = jnp.multiply(act, w1_vmem_ref[...])
+            out_vmem_ref[...] = jnp.multiply(
+                jax.nn.silu(w0_vmem_ref[...]), w1_vmem_ref[...]
+            )
 
             cpo = pltpu.make_async_copy(
                 out_vmem_ref,
@@ -577,6 +577,7 @@ class EPMoE(nnx.Module):
             topk_weights.dtype == jnp.float32
             and topk_ids.dtype == jnp.int32
             and topk_weights.shape == topk_ids.shape
+            and hidden_states.shape[0] >= 512
         )
         if _pack_routing:
             packed_routing = jnp.concatenate(
