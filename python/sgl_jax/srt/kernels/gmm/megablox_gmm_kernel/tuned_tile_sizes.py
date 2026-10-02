@@ -31,7 +31,9 @@ TUNED_TILE_SIZES_GMM_V2 = {
         ("float8_e4m3fn", "float8_e4m3fn", 16, 512, 2048, 6144): (32, 2048, 6144),
         **{
             (lhs_dt, "float8_e4m3fn", g, m, 6144, 2048): (
-                min(128, m),
+                min(128, m)
+                if m <= 1024
+                else (32 if m <= 2048 else (64 if m <= 8192 else (128 if m <= 32768 else 256))),
                 6144,
                 2048,
             )
@@ -57,9 +59,11 @@ TUNED_TILE_SIZES_GMM_V2 = {
         },
         **{
             (lhs_dt, "float8_e4m3fn", g, m, 2048, 6144): (
-                min(128, m),
+                min(128, m)
+                if m <= 1024
+                else (32 if m <= 2048 else (64 if m <= 8192 else (128 if m <= 32768 else 256))),
                 2048,
-                3072,
+                3072 if (m <= 1024 or (lhs_dt == "bfloat16" and m >= 65536)) else 6144,
             )
             for g in (8, 16)
             for lhs_dt in ("float8_e4m3fn", "bfloat16")
