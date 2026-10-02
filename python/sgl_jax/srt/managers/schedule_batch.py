@@ -49,7 +49,11 @@ from sgl_jax.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
+from sgl_jax.srt.mem_cache.radix_cache import (
+    RadixKey,
+    build_bigram_radix_key,
+    build_radix_key,
+)
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -502,7 +506,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=self.match_key(),
+                        key=self.match_key(tree_cache),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -542,8 +546,12 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
-    def match_key(self) -> RadixKey:
+    def match_key(self, tree_cache: BasePrefixCache | None = None) -> RadixKey:
         real_prefix = self.adjust_max_prefix_ids()
+        if tree_cache is not None and getattr(tree_cache, "is_eagle", False):
+            # Bigram keys are memoised per request; chunked prefill re-matches
+            # a 100k-token key every chunk and the conversion dominated the step.
+            return build_bigram_radix_key(self, len(real_prefix))
         return build_radix_key(self, len(real_prefix))
 
     def pop_committed_kv_cache(self) -> int:

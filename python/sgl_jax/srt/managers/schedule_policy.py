@@ -153,7 +153,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            match_key = r.match_key()
+            match_key = r.match_key(self.tree_cache)
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(MatchPrefixParams(key=match_key))
             r.prefix_indices = match_result.device_indices
