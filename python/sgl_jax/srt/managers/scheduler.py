@@ -880,9 +880,11 @@ class Scheduler(
         """
         if self.tree_cache is None:
             return 0
-        result = self.tree_cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, extra_key, dp_rank))
-        )
+        key = RadixKey(token_ids, extra_key, dp_rank)
+        match_len_fn = getattr(self.tree_cache, "match_prefix_len", None)
+        if match_len_fn is not None:
+            return match_len_fn(key)
+        result = self.tree_cache.match_prefix(MatchPrefixParams(key=key))
         return len(result.device_indices)
 
     def _iter_dp_requests(self):
@@ -2186,6 +2188,10 @@ class Scheduler(
             is_eagle_cache = getattr(self.tree_cache, "is_eagle", False)
             key_token_len = coop_target_len + 1 if is_eagle_cache else coop_target_len
             shared_tokens = st["shared_token_ids"][:key_token_len]
+            key_convert_fn = getattr(self.tree_cache, "key_convert_fn", None)
+            converted_shared = (
+                key_convert_fn(shared_tokens) if key_convert_fn is not None else shared_tokens
+            )
             extra_key = st["extra_key"]
             full_kv_indices = st["full_kv_indices"]
             try:
@@ -2194,7 +2200,7 @@ class Scheduler(
             except ImportError:
                 _use_insert_params = False
             for r in range(self.dp_size):
-                rkey = RadixKey(shared_tokens, extra_key, dp_rank=r)
+                rkey = RadixKey(converted_shared, extra_key, dp_rank=r)
                 rval = full_kv_indices[:coop_target_len].copy()
                 if _use_insert_params:
                     self.tree_cache.insert(InsertParams(key=rkey, value=rval))
@@ -2210,6 +2216,19 @@ class Scheduler(
             if self.running_batch.is_empty() and len(self.waiting_queue) <= self.dp_size:
                 for idx, wreq in enumerate(self.waiting_queue):
                     wreq.dp_rank = idx
+            if is_eagle_cache and shared_tokens:
+                last_shared_tok = shared_tokens[-1]
+                for wreq in self.waiting_queue:
+                    if (
+                        getattr(wreq, "_radix_bigram_cache", None) is None
+                        and len(wreq.radix_input_ids) >= key_token_len
+                        and wreq.radix_input_ids[:key_token_len] == shared_tokens
+                    ):
+                        wreq._radix_bigram_cache = (
+                            key_token_len,
+                            list(converted_shared),
+                            last_shared_tok,
+                        )
 
             logger.info(
                 "[CoopPrefill] Global RadixCache populated across all %d DP ranks: "
@@ -2274,8 +2293,10 @@ class Scheduler(
 
         extra_key = first_req.extra_key
         key_token_len = coop_target_len + 1 if is_eagle_cache else coop_target_len
+        probe_tokens = ids0[:key_token_len]
+        lookup_fn = getattr(self, "_lookup_prefix_length", getattr(self, "_cached_prefix_len", None))
         cached_per_rank = [
-            getattr(self, "_lookup_prefix_length", getattr(self, "_cached_prefix_len", None))(ids0[:key_token_len], extra_key, r)
+            lookup_fn(probe_tokens, extra_key, r)
             for r in range(self.dp_size)
         ]
         min_cached = min(cached_per_rank)

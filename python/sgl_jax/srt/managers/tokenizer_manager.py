@@ -16,6 +16,7 @@ import time
 import uuid
 import zlib
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
@@ -226,6 +227,7 @@ class TokenizerManager:
                 )
 
         # Store states
+        self._tokenize_executor = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 8))
         self.no_create_loop = False
         self.rid_to_state: dict[str, ReqState] = {}
         self.health_check_failed = False
@@ -722,6 +724,32 @@ class TokenizerManager:
 
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    rids.append(tmp_obj.rid)
+            elif (
+                batch_size > 1
+                and self.tokenizer is not None
+                and obj.input_ids is None
+                and obj.text is not None
+                and not (isinstance(obj, GenerateReqInput) and obj.contains_mm_input())
+            ):
+                # Tokenize prompts in parallel across worker threads (Rust tokenizers
+                # releases the GIL) while streaming each request to the scheduler in
+                # index order as soon as it finishes, so request 0/1 start CoopPrefill
+                # immediately and the rest arrive well before CoopPrefill completes.
+                futs = [
+                    self._tokenize_executor.submit(self.tokenizer, obj.text[i])
+                    for i in range(batch_size)
+                ]
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    encoded = await asyncio.wrap_future(futs[i])
+                    input_ids = encoded["input_ids"]
+                    self._validate_one_request(tmp_obj, input_ids)
+                    tokenized_obj = self._create_tokenized_object(
+                        tmp_obj, tmp_obj.text, input_ids, None
+                    )
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
