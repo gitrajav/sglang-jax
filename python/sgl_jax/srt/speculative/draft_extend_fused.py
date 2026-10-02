@@ -1581,11 +1581,12 @@ def _build_prefill(num_layers: int, topk: int):
         relay_topk_index = stacked_idx
         relay_verified_id = next_token_ids
         relay_new_seq_lens = target_forward_batch.seq_lens + 1
-        if mesh is not None and not update_relay:
+        if mesh is not None:
             rep = NamedSharding(mesh, P())
             next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), rep)
-            selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
-            stacked_idx = jax.sharding.reshard(stacked_idx, rep)
+            if not update_relay:
+                selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
+                stacked_idx = jax.sharding.reshard(stacked_idx, rep)
 
         updated_relay_buffers = relay_buffers
         if update_relay:
@@ -2283,10 +2284,9 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
             )
     target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
 
-    hidden_size = target_worker.model_config.hidden_size
     model_worker_batch.spec_info_padded = EagleDraftInput(
-        hidden_states=np.zeros((len(model_worker_batch.input_ids), hidden_size), dtype=np.float32),
-        verified_id=np.zeros((len(model_worker_batch.seq_lens),), dtype=np.int32),
+        hidden_states=None,
+        verified_id=None,
         num_tokens_per_batch=np.asarray(1, dtype=np.int32),
         num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
         allocate_lens=model_worker_batch.seq_lens,
@@ -2297,18 +2297,22 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
 
     _workers = getattr(draft_worker, "_workers", None) or [draft_worker._worker]
     draft_mr0 = _workers[0].model_runner
-    draft_mr0.attn_backend.forward_metadata = draft_mr0.attn_backend.get_eagle_forward_metadata(
-        model_worker_batch
+    if (
+        type(draft_mr0.attn_backend) is type(target_mr.attn_backend)
+        and model_worker_batch.forward_mode.is_extend()
+    ):
+        draft_mr0.attn_backend.forward_metadata = target_mr.attn_backend.forward_metadata
+    else:
+        draft_mr0.attn_backend.forward_metadata = draft_mr0.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
+        )
+    draft_forward_batch = replace(
+        target_forward_batch,
+        attn_backend=draft_mr0.attn_backend,
+        spec_info=model_worker_batch.spec_info_padded,
     )
-    draft_forward_batch = ForwardBatch.init_new(model_worker_batch, draft_mr0)
-    draft_forward_batch.input_ids = target_forward_batch.input_ids
-    draft_forward_batch.bid = model_worker_batch.bid
-    draft_logits_indices = _prepare_device_array(
-        model_worker_batch.logits_indices,
-        NamedSharding(draft_worker.mesh, P("data")),
-        "prefill.logits_indices",
-    )
-    draft_logits_metadata = _prepare_logits_metadata(model_worker_batch, draft_worker.mesh)
+    draft_logits_indices = target_logits_metadata.logits_indices
+    draft_logits_metadata = target_logits_metadata
 
     all_memory_pools = []
     all_leaves = []
@@ -2374,17 +2378,9 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         cache_miss_count = count()
     prefill_output_token_ids = None
     if update_relay:
-        if getattr(model_worker_batch, "skip_prefill_output_ids", False):
-            prefill_output_token_ids = np.zeros(
-                (model_worker_batch.req_pool_indices.shape[0],), dtype=np.int32
-            )
-        else:
-            prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
-                draft_worker,
-                next_token_ids,
-            )
-            if hasattr(prefill_output_token_ids, "copy_to_host_async"):
-                prefill_output_token_ids.copy_to_host_async()
+        prefill_output_token_ids = next_token_ids
+        if hasattr(prefill_output_token_ids, "copy_to_host_async"):
+            prefill_output_token_ids.copy_to_host_async()
 
     if launch_done is not None:
         launch_done.set()

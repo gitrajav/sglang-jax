@@ -3053,17 +3053,6 @@ class Scheduler(
                 self.page_size,
                 self.server_args.enable_static_lora,
             )
-            is_coop = getattr(batch, "is_coop_prefill_batch", False) or (
-                batch.reqs_info
-                and batch.reqs_info[0].reqs
-                and str(batch.reqs_info[0].reqs[0].rid).startswith("__coop_prefill_")
-            )
-            has_unchunked = (not is_coop) and any(
-                not (req.finished() or req.is_retracted) and req.is_chunked <= 0
-                for info in batch.reqs_info
-                for req in (info.reqs or ())
-            )
-            model_worker_batch.skip_prefill_output_ids = not has_unchunked
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
