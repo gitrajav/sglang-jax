@@ -761,7 +761,7 @@ def ragged_gather_reduce(
         ),
     )
 
-    # Step 5: Post-process the output (drop padding, cast, zero empty groups).
-    out = out[: input_size // reduce_group_size, :hidden_size].astype(x.dtype)
-    out = jnp.where(mask[: input_size // reduce_group_size, None], out, jnp.zeros((), dtype=x.dtype))
-    return out
+    # Step 5: Post-process the output (drop padding, zero empty groups, cast).
+    out = out[: input_size // reduce_group_size, :hidden_size]
+    out = jnp.where(mask[: input_size // reduce_group_size, None], out, jnp.zeros_like(out))
+    return out.astype(x.dtype)

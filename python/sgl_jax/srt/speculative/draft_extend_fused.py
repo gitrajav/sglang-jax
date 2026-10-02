@@ -526,29 +526,6 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
 
 def _gather_rows_preserve_sharding(values, index):
     sharding = jax.typeof(values).sharding
-    idx_sharding = jax.typeof(index).sharding
-    if (
-        isinstance(sharding, NamedSharding)
-        and isinstance(idx_sharding, NamedSharding)
-        and not sharding.mesh.empty
-        and "data" in sharding.mesh.axis_names
-        and sharding.spec == P("data", None)
-        and idx_sharding.spec == P("data")
-    ):
-        dp_size = sharding.mesh.shape["data"]
-        per_dp_rows = values.shape[0] // dp_size
-
-        def _local_gather(v_local, idx_local):
-            local_idx = idx_local % per_dp_rows
-            return v_local[local_idx, :]
-
-        return jax.shard_map(
-            _local_gather,
-            mesh=sharding.mesh,
-            in_specs=(P("data", None), P("data")),
-            out_specs=P("data", None),
-            check_vma=False,
-        )(values, index)
     if isinstance(sharding, NamedSharding):
         return values.at[index, :].get(out_sharding=sharding)
     return values[index, :]
