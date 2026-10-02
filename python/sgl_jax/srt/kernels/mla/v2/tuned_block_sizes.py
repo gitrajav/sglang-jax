@@ -482,8 +482,6 @@ for _k, _dst in TUNED_BLOCK_SIZES_MLA.items():
                     _v_fp8 = (_tv[0] * 2,) + _tv[1:]
                 elif _tk[0] == "decode" and _tk[6] == 128 and _tk[7] == 2:
                     _v_fp8 = (8, 1, 1)
-                elif _tk[0] == "mixed" and _tk[3] == 64 and _tk[6] == 128 and _tk[7] in (1, 2, 4):
-                    _v_fp8 = (32, _tv[1])
                 else:
                     _v_fp8 = _tv
                 _dst[_k_fp8] = _v_fp8

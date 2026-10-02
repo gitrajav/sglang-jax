@@ -526,6 +526,29 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
 
 def _gather_rows_preserve_sharding(values, index):
     sharding = jax.typeof(values).sharding
+    idx_sharding = jax.typeof(index).sharding
+    if (
+        isinstance(sharding, NamedSharding)
+        and isinstance(idx_sharding, NamedSharding)
+        and not sharding.mesh.empty
+        and "data" in sharding.mesh.axis_names
+        and sharding.spec == P("data", None)
+        and idx_sharding.spec == P("data")
+    ):
+        dp_size = sharding.mesh.shape["data"]
+        per_dp_rows = values.shape[0] // dp_size
+
+        def _local_gather(v_local, idx_local):
+            local_idx = idx_local % per_dp_rows
+            return v_local[local_idx, :]
+
+        return jax.shard_map(
+            _local_gather,
+            mesh=sharding.mesh,
+            in_specs=(P("data", None), P("data")),
+            out_specs=P("data", None),
+            check_vma=False,
+        )(values, index)
     if isinstance(sharding, NamedSharding):
         return values.at[index, :].get(out_sharding=sharding)
     return values[index, :]
@@ -748,6 +771,43 @@ def _repack_page_indices(
     dp_size: int,
 ):
     pages_per_dp = page_indices.shape[0] // dp_size
+    page_sharding = jax.typeof(page_indices).sharding
+    if (
+        isinstance(page_sharding, NamedSharding)
+        and not page_sharding.mesh.empty
+        and "data" in page_sharding.mesh.axis_names
+        and page_sharding.mesh.shape["data"] == dp_size
+    ):
+        mesh = page_sharding.mesh
+        d_sharding = NamedSharding(mesh, P("data"))
+        if jax.typeof(allocated_lens).sharding != d_sharding:
+            allocated_lens = jax.sharding.reshard(allocated_lens, d_sharding)
+        if jax.typeof(metadata_seq_lens).sharding != d_sharding:
+            metadata_seq_lens = jax.sharding.reshard(metadata_seq_lens, d_sharding)
+
+        def _local_repack(local_pages, local_alloc_lens, local_meta_lens):
+            need_pg = ((local_meta_lens + page_size - 1) // page_size).astype(jnp.int32)
+            if local_alloc_lens.shape[0] == 1:
+                valid_1d = jnp.arange(pages_per_dp, dtype=jnp.int32) < need_pg[0]
+                return jnp.where(valid_1d, local_pages, jnp.zeros_like(local_pages))
+            alloc_pg = ((local_alloc_lens + page_size - 1) // page_size).astype(jnp.int32)
+            src_off = jnp.cumsum(alloc_pg, dtype=jnp.int32) - alloc_pg
+            dst_off = jnp.cumsum(need_pg, dtype=jnp.int32) - need_pg
+            pids = jnp.arange(pages_per_dp, dtype=jnp.int32)[:, None]
+            in_r = (pids >= dst_off[None, :]) & (pids < (dst_off + need_pg)[None, :])
+            slot = jnp.argmax(in_r.astype(jnp.int32), axis=1)
+            valid_1d = jnp.any(in_r, axis=1)
+            g_src = (src_off - dst_off)[slot] + jnp.arange(pages_per_dp, dtype=jnp.int32)
+            g_pages = local_pages.at[g_src].get(mode="fill", fill_value=0)
+            return jnp.where(valid_1d, g_pages, jnp.zeros_like(g_pages))
+
+        return jax.shard_map(
+            _local_repack,
+            mesh=mesh,
+            in_specs=(P("data"), P("data"), P("data")),
+            out_specs=P("data"),
+            check_vma=False,
+        )(page_indices, allocated_lens, metadata_seq_lens)
 
     allocated_pages = ((allocated_lens + page_size - 1) // page_size).astype(jnp.int32)
     needed_pages = ((metadata_seq_lens + page_size - 1) // page_size).astype(jnp.int32)

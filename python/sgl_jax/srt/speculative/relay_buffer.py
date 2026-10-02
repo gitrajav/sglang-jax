@@ -168,6 +168,49 @@ def gather_spec_relay_buffers(
 ):
     """Gather DP-padded draft state for the next batch."""
     per_dp_bs = future_indices.shape[0] // dp_size
+    flat_sharding = jax.typeof(future_indices).sharding
+    if (
+        isinstance(flat_sharding, NamedSharding)
+        and not flat_sharding.mesh.empty
+        and "data" in flat_sharding.mesh.axis_names
+        and flat_sharding.mesh.shape["data"] == dp_size
+    ):
+        mesh = flat_sharding.mesh
+
+        def _local_gather(tk_b, hs_b, vid_b, nsl_b, f_idx):
+            idx = f_idx.reshape((per_dp_bs,))
+            return (
+                tk_b[0, idx],
+                hs_b[0, idx],
+                vid_b[0, idx],
+                nsl_b[0, idx],
+            )
+
+        return jax.shard_map(
+            _local_gather,
+            mesh=mesh,
+            in_specs=(
+                RELAY_STATE_SPEC,
+                RELAY_STATE_SPEC,
+                RELAY_ID_SPEC,
+                RELAY_ID_SPEC,
+                P("data"),
+            ),
+            out_specs=(
+                P("data", None),
+                P("data", None),
+                P("data"),
+                P("data"),
+            ),
+            check_vma=False,
+        )(
+            buffers.topk_index,
+            buffers.hidden_states,
+            buffers.verified_id,
+            buffers.new_seq_lens,
+            future_indices,
+        )
+
     indices = future_indices.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
     topk_index = (
@@ -190,7 +233,6 @@ def gather_spec_relay_buffers(
         .get(out_sharding=RELAY_ID_SPEC)
         .reshape(future_indices.shape)
     )
-    flat_sharding = jax.typeof(future_indices).sharding
     if isinstance(flat_sharding, NamedSharding) and not flat_sharding.mesh.empty:
         state_sharding = NamedSharding(flat_sharding.mesh, P("data", None))
         topk_index = jax.sharding.reshard(topk_index, state_sharding)

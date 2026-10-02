@@ -519,17 +519,7 @@ class RadixCache(BasePrefixCache):
             while cur is not None:
                 cur.last_access_time = now
                 cur = cur.parent
-            inserted_match_len = self._insert_helper(last_node, tail_key, tail_val)
-            new_prefix_len = old_prefix_len + inserted_match_len
-            if inserted_match_len == 0 and len(tail_key) > 0:
-                new_last_node = last_node.children[self.get_child_key_fn(tail_key)]
-                req.last_matched_prefix_len = page_aligned_len
-                req.cache_protected_len = page_aligned_len
-                self.dec_lock_ref(req.last_node)
-                self.inc_lock_ref(new_last_node)
-                req.prefix_indices = kv_indices
-                req.last_node = new_last_node
-                return
+            new_prefix_len = old_prefix_len + self._insert_helper(last_node, tail_key, tail_val)
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
             )

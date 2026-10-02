@@ -154,6 +154,57 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         col_size=1408,
         col_chunk_size=1408,
     ),
+    **{
+        TuningKey(
+            input_size=inp_sz,
+            hidden_size=6144,
+            reduce_group_size=8,
+            dtype="bfloat16",
+        ): TunableParams(
+            num_column_partitions=8,
+            num_row_partitions=4,
+            num_row_subchunks=4,
+            row_chunk_size=64,
+            aligned_hidden_size=6144,
+            col_size=768,
+            col_chunk_size=768,
+        )
+        for inp_sz in (256, 512, 1024, 2048, 4096, 8192)
+    },
+    **{
+        TuningKey(
+            input_size=inp_sz,
+            hidden_size=6144,
+            reduce_group_size=8,
+            dtype="bfloat16",
+        ): TunableParams(
+            num_column_partitions=4,
+            num_row_partitions=8,
+            num_row_subchunks=4,
+            row_chunk_size=64,
+            aligned_hidden_size=6144,
+            col_size=1536,
+            col_chunk_size=768,
+        )
+        for inp_sz in (16384, 32768, 65536, 131072)
+    },
+    **{
+        TuningKey(
+            input_size=inp_sz,
+            hidden_size=6144,
+            reduce_group_size=8,
+            dtype="bfloat16",
+        ): TunableParams(
+            num_column_partitions=2,
+            num_row_partitions=16,
+            num_row_subchunks=4,
+            row_chunk_size=64,
+            aligned_hidden_size=6144,
+            col_size=3072,
+            col_chunk_size=1024,
+        )
+        for inp_sz in (262144, 524288)
+    },
 }
 
 

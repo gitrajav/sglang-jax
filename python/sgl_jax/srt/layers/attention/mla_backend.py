@@ -389,13 +389,20 @@ class MLAAttentionBackend(AttentionBackend):
                     start_page = pos_base // self.page_size
                     dp_sz = self.mesh.shape[dpa]
                     pages_per_step = (dp_sz * coop_chunk) // self.page_size
-                    all_kv_c = jax.lax.all_gather(new_kv_c_, dpa, axis=0, tiled=True)
-                    all_k_pe = jax.lax.all_gather(new_k_pe_, dpa, axis=0, tiled=True)
-                    nope_pad = ((all_kv_c.shape[-1] + 127) // 128) * 128 - all_kv_c.shape[-1]
-                    rope_pad = ((all_k_pe.shape[-1] + 127) // 128) * 128 - all_k_pe.shape[-1]
-                    kv_c_padded = jnp.pad(all_kv_c, ((0, 0), (0, nope_pad))).astype(c_.dtype)
-                    k_pe_padded = jnp.pad(all_k_pe, ((0, 0), (0, rope_pad))).astype(c_.dtype)
-                    merged = jnp.concatenate([kv_c_padded, k_pe_padded], axis=-1)
+                    nope_pad = ((new_kv_c_.shape[-1] + 127) // 128) * 128 - new_kv_c_.shape[-1]
+                    rope_pad = ((new_k_pe_.shape[-1] + 127) // 128) * 128 - new_k_pe_.shape[-1]
+                    kv_c_local = (
+                        jnp.pad(new_kv_c_, ((0, 0), (0, nope_pad)))
+                        if nope_pad > 0
+                        else new_kv_c_
+                    ).astype(c_.dtype)
+                    k_pe_local = (
+                        jnp.pad(new_k_pe_, ((0, 0), (0, rope_pad)))
+                        if rope_pad > 0
+                        else new_k_pe_
+                    ).astype(c_.dtype)
+                    local_merged = jnp.concatenate([kv_c_local, k_pe_local], axis=-1)
+                    merged = jax.lax.all_gather(local_merged, dpa, axis=0, tiled=True)
                     merged_pages = merged.reshape(
                         pages_per_step, c_.shape[1], c_.shape[2], c_.shape[3]
                     )
