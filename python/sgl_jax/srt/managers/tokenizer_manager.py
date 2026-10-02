@@ -805,8 +805,6 @@ class TokenizerManager:
                             state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                             generators.append(self._wait_one_response(tmp_obj, state, request))
                             rids.append(tmp_obj.rid)
-                            if i == 1 and batch_size > 2:
-                                await asyncio.sleep(0)
                     else:
                         cut = -1
                 if cut < 2048:
