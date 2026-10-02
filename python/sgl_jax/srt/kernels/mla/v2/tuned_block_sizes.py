@@ -434,11 +434,19 @@ TUNED_BLOCK_SIZES_MLA["TPU v7"].update({
     ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 8): (16, 4),
     ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 16): (16, 4),
     ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 32): (16, 4),  # 0.5876 ms  [mla_tuned_blocks_heads64_dp32.txt]
-    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 64): (4, 16),  # 0.7862 ms  [mla_tuned_blocks_heads64_dp32.txt]
-    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 128): (8, 16),  # 0.9721 ms  [mla_tuned_blocks_heads64_dp32.txt]
-    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 256): (8, 16),  # 1.4205 ms  [mla_tuned_blocks_heads64_dp32.txt]
-    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 512): (4, 32),  # 2.3754 ms  [mla_tuned_blocks_heads64_dp32.txt]
-    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 1024): (16, 16),  # 4.3340 ms  [mla_tuned_blocks_heads64_dp32.txt]
+    # Prefill (mixed, mnt >= 64): one 2048-token KV block per step regardless of
+    # mnt bucket; the kernel's VMEM footprint depends only on (bkv_p, bq), and
+    # bkv_p=4/8 doubled the sequential KV loop count at 100k context.
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 64): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 128): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 256): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 512): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 1024): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 2048): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 4096): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 8192): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 16384): (16, 16),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 32768): (16, 16),
 })
 # === END injected tuned MLA block sizes ===
 
