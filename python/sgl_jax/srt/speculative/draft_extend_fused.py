@@ -570,7 +570,6 @@ def _build_chain_verify_arrays(
     """Build topk=1 linear-chain verify inputs in-JIT without stacking shardings."""
     n = num_verify_tokens
     bs = batch_size
-    tid_range = jnp.arange(n, dtype=jnp.int32)
     seq_sharding = jax.typeof(seq_lens).sharding
     if (
         isinstance(seq_sharding, NamedSharding)
@@ -594,7 +593,10 @@ def _build_chain_verify_arrays(
                     [v_id.astype(jnp.int32)[:, None], t_list[:, : n - 1].astype(jnp.int32)],
                     axis=1,
                 ).reshape(local_bs * n),
-                (s_lens.astype(jnp.int32)[:, None] + tid_range[None, :]).reshape(local_bs * n),
+                (
+                    s_lens.astype(jnp.int32)[:, None]
+                    + jnp.arange(n, dtype=jnp.int32)[None, :]
+                ).reshape(local_bs * n),
             ),
             mesh=mesh,
             in_specs=(P("data"), P("data", None), P("data")),
@@ -602,6 +604,7 @@ def _build_chain_verify_arrays(
             check_vma=False,
         )(verified_id, token_list, seq_lens)
     else:
+        tid_range = jnp.arange(n, dtype=jnp.int32)
         verified_column = verified_id.astype(jnp.int32)[:, None]
         token_chain = token_list[:, : n - 1].astype(jnp.int32)
         verified_sharding = jax.typeof(verified_column).sharding
