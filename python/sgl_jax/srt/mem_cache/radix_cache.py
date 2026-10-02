@@ -155,7 +155,33 @@ def _convert_to_bigram_key(tokens: list[int]) -> list[tuple[int, int]]:
         return []
     if isinstance(tokens[0], tuple):
         return tokens
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+    return list(zip(tokens, tokens[1:]))
+
+
+def build_bigram_radix_key(req: Req, key_len: int) -> RadixKey:
+    """Bigram radix key for ``req`` memoised across chunked prefill rounds.
+
+    Chunked prefill calls insert and match_prefix once per chunk per request,
+    and each converted the whole 100k-token key again. The memo keeps the
+    bigrams of the prefix already converted and only extends them.
+    """
+    key_sequence = req.radix_input_ids + req.output_ids if req.output_ids else req.radix_input_ids
+    cache = getattr(req, "_radix_bigram_cache", None)
+    need = max(0, key_len - 1)
+    if cache is None or cache[0] > len(key_sequence) or (
+        cache[0] > 0 and key_sequence[cache[0] - 1] != cache[2]
+    ):
+        bigrams: list[tuple[int, int]] = []
+        done = 0
+    else:
+        done, bigrams, _ = cache
+    if need > len(bigrams):
+        # bigrams[i] = (seq[i], seq[i+1]); extend from the last converted token.
+        start = len(bigrams)
+        bigrams.extend(zip(key_sequence[start:need], key_sequence[start + 1 : need + 1]))
+        done = need + 1
+        req._radix_bigram_cache = (done, bigrams, key_sequence[done - 1])
+    return RadixKey(bigrams[:need], req.extra_key, req.dp_rank)
 
 
 class RadixCache(BasePrefixCache):
@@ -242,19 +268,13 @@ class RadixCache(BasePrefixCache):
 
         token_sequences, last_node = self._match_prefix_helper(self.root_node, converted_key)
 
-        if token_sequences:
-            valid_tokens = []
-            for tokens in token_sequences:
-                if tokens is not None and len(tokens) > 0:
-                    if isinstance(tokens, (list, tuple)):
-                        valid_tokens.extend(tokens)
-                    elif isinstance(tokens, np.ndarray):
-                        valid_tokens.extend(tokens.tolist())
-
-            if valid_tokens:
-                matched_tokens = np.array(valid_tokens, dtype=np.int32)
-            else:
-                matched_tokens = np.empty((0,), dtype=np.int32)
+        parts = [
+            np.asarray(tokens, dtype=np.int32)
+            for tokens in token_sequences
+            if tokens is not None and len(tokens) > 0
+        ]
+        if parts:
+            matched_tokens = parts[0] if len(parts) == 1 else np.concatenate(parts)
         else:
             matched_tokens = np.empty((0,), dtype=np.int32)
 
@@ -305,7 +325,11 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             return
 
-        radix_key = build_radix_key(req, committed_kv_len)
+        radix_key = (
+            build_bigram_radix_key(req, committed_kv_len)
+            if self.is_eagle
+            else build_radix_key(req, committed_kv_len)
+        )
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
@@ -369,7 +393,11 @@ class RadixCache(BasePrefixCache):
         # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
         # Real fill_ids drive kv slicing above; the KEY uses the hash-substituted ids.
-        radix_key = build_radix_key(req, page_aligned_token_len)
+        radix_key = (
+            build_bigram_radix_key(req, page_aligned_token_len)
+            if self.is_eagle
+            else build_radix_key(req, page_aligned_token_len)
+        )
 
         # cache_protected_len, not len(prefix_indices): see cache_finished_req above.
         old_prefix_len = req.cache_protected_len
