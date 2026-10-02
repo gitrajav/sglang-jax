@@ -726,10 +726,12 @@ class TokenizerManager:
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
             else:
-                # Sequential tokenization and processing
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                # Tokenize the whole batch first, then send back to back so the
+                # scheduler sees the burst in one poll and forms a single prefill
+                # wave instead of a short first wave plus stragglers.
+                tmp_objs = [obj[i] for i in range(batch_size)]
+                tokenized_objs = [await self._tokenize_one_request(o) for o in tmp_objs]
+                for tmp_obj, tokenized_obj in zip(tmp_objs, tokenized_objs):
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)

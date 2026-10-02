@@ -2370,6 +2370,49 @@ class Scheduler(
         )
         return self._build_coop_step_batch(self._coop_prefill_state)
 
+    def _coalesce_request_burst(self) -> None:
+        """Briefly drain a request burst before forming the first prefill batch.
+
+        TokenizerManager streams a batched /generate request to the scheduler one
+        request at a time; the first poll typically sees only part of it. When the
+        engine is idle and the waiting queue could still absorb more requests, poll
+        for up to SGL_PREFILL_COALESCE_MS more so one prefill wave covers the whole
+        burst instead of a short first wave plus a straggler wave. Every node runs
+        the same recv_requests() sequence (the loop state is driven by broadcast
+        data), so the multi host lockstep is preserved.
+        """
+        budget_ms = getattr(self, "_prefill_coalesce_ms", None)
+        if budget_ms is None:
+            budget_ms = float(os.environ.get("SGL_PREFILL_COALESCE_MS", "60") or 0)
+            self._prefill_coalesce_ms = budget_ms
+        if budget_ms <= 0 or not self.waiting_queue or not self.running_batch.is_empty():
+            return
+        if any(req is not None for req in self.chunked_reqs):
+            return
+        capacity = self.per_dp_max_running_requests * self.dp_size
+        if len(self.waiting_queue) >= capacity:
+            return
+
+        poll_s = 0.005
+        max_polls = max(1, int(budget_ms / (poll_s * 1000)))
+        quiet_polls = 0
+        for _ in range(max_polls):
+            if len(self.waiting_queue) >= capacity or quiet_polls >= 2:
+                break
+            if self.node_rank == 0:
+                time.sleep(poll_s)
+            more_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            if more_reqs:
+                quiet_polls = 0
+                more_reqs = self.select_dp_for_request(more_reqs)
+                self.process_input_requests(more_reqs)
+            else:
+                quiet_polls += 1
+
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         # Pathways-PD sets _pd_admission_paused while its D-pool token gate is
         # closed: existing chunked requests still advance, but nothing new is
@@ -2388,6 +2431,7 @@ class Scheduler(
             coop_batch = self._maybe_get_coop_prefill_batch()
             if coop_batch is not None:
                 return coop_batch
+            self._coalesce_request_burst()
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
