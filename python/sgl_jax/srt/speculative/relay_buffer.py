@@ -87,6 +87,77 @@ def update_spec_relay_buffers(
 ) -> SpecRelayBuffers:
     """Write DP-padded draft state into relay buffers without touching padded rows."""
     per_dp_bs = future_indices.shape[0] // dp_size
+    flat_sharding = jax.typeof(future_indices).sharding
+    if (
+        isinstance(flat_sharding, NamedSharding)
+        and not flat_sharding.mesh.empty
+        and "data" in flat_sharding.mesh.axis_names
+        and flat_sharding.mesh.shape["data"] == dp_size
+    ):
+        mesh = flat_sharding.mesh
+        d1_sharding = NamedSharding(mesh, P("data"))
+        d2_sharding = NamedSharding(mesh, P("data", None))
+        if jax.typeof(valid_mask).sharding != d1_sharding:
+            valid_mask = jax.sharding.reshard(valid_mask, d1_sharding)
+        if jax.typeof(verified_id).sharding != d1_sharding:
+            verified_id = jax.sharding.reshard(verified_id, d1_sharding)
+        if jax.typeof(new_seq_lens).sharding != d1_sharding:
+            new_seq_lens = jax.sharding.reshard(new_seq_lens, d1_sharding)
+        if jax.typeof(topk_index).sharding != d2_sharding:
+            topk_index = jax.sharding.reshard(topk_index, d2_sharding)
+        if jax.typeof(hidden_states).sharding != d2_sharding:
+            hidden_states = jax.sharding.reshard(hidden_states, d2_sharding)
+
+        def _local_update(tk_b, hs_b, vid_b, nsl_b, f_idx, v_mask, tk_u, hs_u, vid_u, nsl_u):
+            idx = f_idx.reshape((per_dp_bs,))
+            val = v_mask.reshape((per_dp_bs,))
+            s_idx = jnp.where(val, idx, jnp.full_like(idx, tk_b.shape[1]))
+            return SpecRelayBuffers(
+                topk_index=tk_b.at[0, s_idx].set(
+                    tk_u.reshape((per_dp_bs,) + tk_u.shape[1:]), mode="drop"
+                ),
+                hidden_states=hs_b.at[0, s_idx].set(
+                    hs_u.reshape((per_dp_bs,) + hs_u.shape[1:]), mode="drop"
+                ),
+                verified_id=vid_b.at[0, s_idx].set(vid_u.reshape((per_dp_bs,)), mode="drop"),
+                new_seq_lens=nsl_b.at[0, s_idx].set(nsl_u.reshape((per_dp_bs,)), mode="drop"),
+            )
+
+        return jax.shard_map(
+            _local_update,
+            mesh=mesh,
+            in_specs=(
+                RELAY_STATE_SPEC,
+                RELAY_STATE_SPEC,
+                RELAY_ID_SPEC,
+                RELAY_ID_SPEC,
+                P("data"),
+                P("data"),
+                P("data", None),
+                P("data", None),
+                P("data"),
+                P("data"),
+            ),
+            out_specs=SpecRelayBuffers(
+                topk_index=RELAY_STATE_SPEC,
+                hidden_states=RELAY_STATE_SPEC,
+                verified_id=RELAY_ID_SPEC,
+                new_seq_lens=RELAY_ID_SPEC,
+            ),
+            check_vma=False,
+        )(
+            buffers.topk_index,
+            buffers.hidden_states,
+            buffers.verified_id,
+            buffers.new_seq_lens,
+            future_indices,
+            valid_mask,
+            topk_index,
+            hidden_states,
+            verified_id,
+            new_seq_lens,
+        )
+
     indices = future_indices.reshape((dp_size, per_dp_bs))
     valid = valid_mask.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]

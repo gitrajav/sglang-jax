@@ -3057,6 +3057,8 @@ class Scheduler(
                 self.page_size,
                 self.server_args.enable_static_lora,
             )
+            if getattr(batch, "is_coop_prefill_batch", False):
+                model_worker_batch.is_coop_prefill_batch = True
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
