@@ -498,22 +498,28 @@ class Req:
                 self.last_host_node = tree_cache.root_node
                 self.host_hit_length = 0
             else:
-                # A running recurrent req already OWNS its state (running slot):
-                # no re-clone (cow_recurrent=False), FULL-only match -- its
-                # unfinished prefix is not gated on recurrent-tree validation.
-                is_running_recurrent = (
-                    tree_cache.supports_recurrent() and self.recurrent_pool_idx is not None
-                )
-                match_result = tree_cache.match_prefix(
-                    MatchPrefixParams(
-                        key=self.match_key(tree_cache),
-                        cow_recurrent=(
-                            tree_cache.supports_recurrent() and not is_running_recurrent
-                        ),
-                        full_only=is_running_recurrent,
-                        req=self,
+                prematched = getattr(self, "_coop_prematched_result", None)
+                if prematched is not None:
+                    self._coop_prematched_result = None
+                    self.adjust_max_prefix_len()
+                    match_result = prematched
+                else:
+                    # A running recurrent req already OWNS its state (running slot):
+                    # no re-clone (cow_recurrent=False), FULL-only match -- its
+                    # unfinished prefix is not gated on recurrent-tree validation.
+                    is_running_recurrent = (
+                        tree_cache.supports_recurrent() and self.recurrent_pool_idx is not None
                     )
-                )
+                    match_result = tree_cache.match_prefix(
+                        MatchPrefixParams(
+                            key=self.match_key(tree_cache),
+                            cow_recurrent=(
+                                tree_cache.supports_recurrent() and not is_running_recurrent
+                            ),
+                            full_only=is_running_recurrent,
+                            req=self,
+                        )
+                    )
                 self.prefix_indices = match_result.device_indices
                 self.last_node = match_result.last_device_node
                 self.last_host_node = match_result.last_host_node
@@ -521,7 +527,7 @@ class Req:
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
-    def adjust_max_prefix_ids(self):
+    def adjust_max_prefix_len(self) -> int:
         self.fill_ids = (
             self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
         )
@@ -543,16 +549,18 @@ class Req:
             # already captured for this request (including completed chunks).
             max_prefix_len = min(max_prefix_len, len(self.hidden_states))
 
-        max_prefix_len = max(max_prefix_len, 0)
-        return self.fill_ids[:max_prefix_len]
+        return max(max_prefix_len, 0)
+
+    def adjust_max_prefix_ids(self):
+        return self.fill_ids[: self.adjust_max_prefix_len()]
 
     def match_key(self, tree_cache: BasePrefixCache | None = None) -> RadixKey:
-        real_prefix = self.adjust_max_prefix_ids()
+        prefix_len = self.adjust_max_prefix_len()
         if tree_cache is not None and getattr(tree_cache, "is_eagle", False):
             # Bigram keys are memoised per request; chunked prefill re-matches
             # a 100k-token key every chunk and the conversion dominated the step.
-            return build_bigram_radix_key(self, len(real_prefix))
-        return build_radix_key(self, len(real_prefix))
+            return build_bigram_radix_key(self, prefix_len)
+        return build_radix_key(self, prefix_len)
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time

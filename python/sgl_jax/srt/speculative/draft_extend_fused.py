@@ -494,10 +494,7 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
-        N = ext_rank.shape[0]
-        idx = jnp.arange(N)
-        mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
-        ext_rank_cumsum = jnp.dot(mask, ext_rank)
+        ext_rank_cumsum = jnp.cumsum(ext_rank, axis=0)
 
         starts = ext_rank_cumsum - ext_rank
         ends = starts + ext_rank
@@ -505,21 +502,14 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
 
-        one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
-        req_starts = jnp.dot(one_hot_slot, starts)
-        req_lens = jnp.dot(one_hot_slot, ext_rank)
-        req_verified = jnp.dot(one_hot_slot, verified_rank)
+        req_starts = jnp.take(starts, slot)
+        req_lens = jnp.take(ext_rank, slot)
+        req_verified = jnp.take(verified_rank, slot)
 
-        shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
-        one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
-        shifted = jnp.dot(one_hot_shifted, ids_rank)
+        shifted = jnp.concatenate([ids_rank[1:], ids_rank[-1:]], axis=0)
 
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
-        is_last_int = is_last.astype(jnp.int32)
-        rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
-
-        has_req_int = has_req.astype(jnp.int32)
-        return has_req_int * rotated + (1 - has_req_int) * ids_rank
+        return jnp.where(has_req, jnp.where(is_last, req_verified, shifted), ids_rank)
 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
@@ -2384,12 +2374,17 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         cache_miss_count = count()
     prefill_output_token_ids = None
     if update_relay:
-        prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
-            draft_worker,
-            next_token_ids,
-        )
-        if hasattr(prefill_output_token_ids, "copy_to_host_async"):
-            prefill_output_token_ids.copy_to_host_async()
+        if getattr(model_worker_batch, "skip_prefill_output_ids", False):
+            prefill_output_token_ids = np.zeros(
+                (model_worker_batch.req_pool_indices.shape[0],), dtype=np.int32
+            )
+        else:
+            prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
+                draft_worker,
+                next_token_ids,
+            )
+            if hasattr(prefill_output_token_ids, "copy_to_host_async"):
+                prefill_output_token_ids.copy_to_host_async()
 
     if launch_done is not None:
         launch_done.set()

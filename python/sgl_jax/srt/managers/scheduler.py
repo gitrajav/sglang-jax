@@ -2048,7 +2048,7 @@ class Scheduler(
         # waiting prefills starve running decodes (observed 110s spike at c64).
         df = getattr(self, "_decode_first_n", None)
         if df is None:
-            df = int(os.environ.get("SGL_DECODE_FIRST_INTERLEAVE", "0"))
+            df = int(os.environ.get("SGL_DECODE_FIRST_INTERLEAVE", "5"))
             self._decode_first_n = df
             self._consec_decode = 0
         skip_prefill = (
@@ -2164,7 +2164,11 @@ class Scheduler(
             # from tokenizer_manager in lockstep across all nodes.
             empty_polls = 0
             for _ in range(80):
-                if len(self.waiting_queue) >= self.dp_size or empty_polls >= 25:
+                if (
+                    len(self.waiting_queue) >= self.dp_size
+                    or empty_polls >= 25
+                    or (len(self.waiting_queue) >= 16 and empty_polls >= 4)
+                ):
                     break
                 if self.node_rank == 0:
                     time.sleep(0.01)
@@ -2195,10 +2199,14 @@ class Scheduler(
             extra_key = st["extra_key"]
             full_kv_indices = st["full_kv_indices"]
             try:
-                from sgl_jax.srt.mem_cache.base_prefix_cache import InsertParams
+                from sgl_jax.srt.mem_cache.base_prefix_cache import InsertParams, MatchResult
                 _use_insert_params = True
             except ImportError:
                 _use_insert_params = False
+                MatchResult = None
+            coop_match_by_rank = {}
+            root_children = getattr(getattr(self.tree_cache, "root_node", None), "children", None)
+            get_child_key_fn = getattr(self.tree_cache, "get_child_key_fn", None)
             for r in range(self.dp_size):
                 rkey = RadixKey(converted_shared, extra_key, dp_rank=r)
                 rval = full_kv_indices[:coop_target_len].copy()
@@ -2211,6 +2219,16 @@ class Scheduler(
                     self.token_to_kv_pool_allocator.free(
                         extra_indices, dp_rank=r
                     )
+                if MatchResult is not None and root_children is not None and get_child_key_fn is not None:
+                    child = root_children.get(get_child_key_fn(rkey))
+                    if child is not None and len(child.key) == len(rkey) and not child.children:
+                        coop_match_by_rank[r] = MatchResult(
+                            device_indices=np.asarray(child.value, dtype=np.int32),
+                            last_device_node=child,
+                            last_host_node=child,
+                            best_match_node=child,
+                            host_hit_length=0,
+                        )
             self._coop_prefill_state = None
 
             if self.running_batch.is_empty() and len(self.waiting_queue) <= self.dp_size:
@@ -2222,6 +2240,7 @@ class Scheduler(
                     if (
                         getattr(wreq, "_radix_bigram_cache", None) is None
                         and len(wreq.radix_input_ids) >= key_token_len
+                        and wreq.radix_input_ids[key_token_len - 1] == last_shared_tok
                         and wreq.radix_input_ids[:key_token_len] == shared_tokens
                     ):
                         wreq._radix_bigram_cache = (
@@ -2229,6 +2248,8 @@ class Scheduler(
                             list(converted_shared),
                             last_shared_tok,
                         )
+                        if wreq.dp_rank in coop_match_by_rank:
+                            wreq._coop_prematched_result = coop_match_by_rank[wreq.dp_rank]
 
             logger.info(
                 "[CoopPrefill] Global RadixCache populated across all %d DP ranks: "
@@ -3032,6 +3053,17 @@ class Scheduler(
                 self.page_size,
                 self.server_args.enable_static_lora,
             )
+            is_coop = getattr(batch, "is_coop_prefill_batch", False) or (
+                batch.reqs_info
+                and batch.reqs_info[0].reqs
+                and str(batch.reqs_info[0].reqs[0].rid).startswith("__coop_prefill_")
+            )
+            has_unchunked = (not is_coop) and any(
+                not (req.finished() or req.is_retracted) and req.is_chunked <= 0
+                for info in batch.reqs_info
+                for req in (info.reqs or ())
+            )
+            model_worker_batch.skip_prefill_output_ids = not has_unchunked
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
