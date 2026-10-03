@@ -740,24 +740,66 @@ class TokenizerManager:
                 # prefix, tokenize the prefix once and verify boundary exactness on
                 # prompt 0 before reusing it across the batch.
                 texts = obj.text
-                cp = (
-                    os.path.commonprefix(texts)
-                    if isinstance(texts, list) and all(isinstance(t, str) for t in texts)
-                    else ""
-                )
+                if isinstance(texts, list) and all(isinstance(t, str) for t in texts):
+                    cp = os.path.commonprefix(texts[:2])
+                    for t in texts[2:]:
+                        if not t.startswith(cp):
+                            cp = os.path.commonprefix([cp, t])
+                            if not cp:
+                                break
+                else:
+                    cp = ""
                 cut = cp.rfind(" ", 0, max(0, len(cp) - 128)) if len(cp) >= 4096 else -1
                 if cut >= 2048:
                     pref_str = texts[0][:cut]
                     cached_pref = getattr(self, "_last_prefix_token_cache", None)
-                    w_lo = max(0, cut - 64)
-                    w_hi = min(len(texts[0]), cut + 64)
-                    can_split = (
-                        self.tokenizer(texts[0][w_lo:cut], add_special_tokens=False)["input_ids"]
-                        + self.tokenizer(texts[0][cut:w_hi], add_special_tokens=False)["input_ids"]
-                        == self.tokenizer(texts[0][w_lo:w_hi], add_special_tokens=False)[
-                            "input_ids"
-                        ]
-                    )
+                    cache_hit = cached_pref is not None and cached_pref[0] == pref_str
+                    valid_pref_cuts = [0, cut]
+                    if cache_hit or len(pref_str) < 32768:
+                        w_lo = max(0, cut - 64)
+                        w_hi = min(len(texts[0]), cut + 64)
+                        win_ids = self.tokenizer(
+                            [texts[0][w_lo:cut], texts[0][cut:w_hi], texts[0][w_lo:w_hi]],
+                            add_special_tokens=False,
+                        )["input_ids"]
+                        can_split = win_ids[0] + win_ids[1] == win_ids[2]
+                    else:
+                        n_parts = 14
+                        step = cut // n_parts
+                        raw_cuts = []
+                        prev_c = 0
+                        for p_i in range(1, n_parts):
+                            target_c = p_i * step
+                            c_pos = pref_str.rfind(
+                                " ",
+                                max(prev_c + 512, target_c - 256),
+                                min(cut - 512, target_c + 256),
+                            )
+                            if c_pos == -1:
+                                c_pos = target_c
+                            if c_pos > prev_c + 512 and c_pos < cut - 512:
+                                raw_cuts.append(c_pos)
+                                prev_c = c_pos
+                        all_splits = raw_cuts + [cut]
+                        win_strs = []
+                        for s_pos in all_splits:
+                            w_lo = max(0, s_pos - 64)
+                            w_hi = min(len(texts[0]), s_pos + 64)
+                            win_strs.append(texts[0][w_lo:s_pos])
+                            win_strs.append(texts[0][s_pos:w_hi])
+                            win_strs.append(texts[0][w_lo:w_hi])
+                        win_ids = self.tokenizer(win_strs, add_special_tokens=False)["input_ids"]
+                        outer_idx = 3 * (len(all_splits) - 1)
+                        can_split = (
+                            win_ids[outer_idx] + win_ids[outer_idx + 1] == win_ids[outer_idx + 2]
+                        )
+                        if can_split:
+                            valid_pref_cuts = [0]
+                            for idx_c, c_pos in enumerate(raw_cuts):
+                                b_idx = 3 * idx_c
+                                if win_ids[b_idx] + win_ids[b_idx + 1] == win_ids[b_idx + 2]:
+                                    valid_pref_cuts.append(c_pos)
+                            valid_pref_cuts.append(cut)
                     if can_split:
                         f_suf0 = self._tokenize_executor.submit(
                             self.tokenizer, texts[0][cut:], add_special_tokens=False
@@ -765,33 +807,39 @@ class TokenizerManager:
                         f_suf1 = self._tokenize_executor.submit(
                             self.tokenizer, texts[1][cut:], add_special_tokens=False
                         )
-                        if cached_pref is not None and cached_pref[0] == pref_str:
-                            f_pref = None
+                        if cache_hit:
+                            f_pref_parts = None
                             pref_ids = cached_pref[1]
                         else:
-                            f_pref = self._tokenize_executor.submit(self.tokenizer, pref_str)
+                            f_pref_parts = [
+                                (
+                                    self._tokenize_executor.submit(
+                                        self.tokenizer,
+                                        pref_str[valid_pref_cuts[p_i] : valid_pref_cuts[p_i + 1]],
+                                    )
+                                    if p_i == 0
+                                    else self._tokenize_executor.submit(
+                                        self.tokenizer,
+                                        pref_str[valid_pref_cuts[p_i] : valid_pref_cuts[p_i + 1]],
+                                        add_special_tokens=False,
+                                    )
+                                )
+                                for p_i in range(len(valid_pref_cuts) - 1)
+                            ]
                             pref_ids = None
-                        f_sufs_rest = [
-                            self._tokenize_executor.submit(
-                                self.tokenizer, texts[i][cut:], add_special_tokens=False
-                            )
-                            for i in range(2, batch_size)
-                        ]
                         suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
-                        if f_pref is not None:
-                            pref_ids = (await asyncio.wrap_future(f_pref))["input_ids"]
+                        suf1 = (await asyncio.wrap_future(f_suf1))["input_ids"]
+                        if f_pref_parts is not None:
+                            part_lists = [
+                                (await asyncio.wrap_future(fp))["input_ids"] for fp in f_pref_parts
+                            ]
+                            pref_ids = []
+                            for pl in part_lists:
+                                pref_ids.extend(pl)
                             self._last_prefix_token_cache = (pref_str, pref_ids)
-                        full0 = pref_ids + suf0
-                        for i in range(batch_size):
+                        for i in range(min(2, batch_size)):
                             tmp_obj = obj[i]
-                            if i == 0:
-                                input_ids = full0
-                            elif i == 1:
-                                suf1 = (await asyncio.wrap_future(f_suf1))["input_ids"]
-                                input_ids = pref_ids + suf1
-                            else:
-                                suf_i = (await asyncio.wrap_future(f_sufs_rest[i - 2]))["input_ids"]
-                                input_ids = pref_ids + suf_i
+                            input_ids = pref_ids + (suf0 if i == 0 else suf1)
                             self._validate_one_request(tmp_obj, input_ids)
                             tokenized_obj = self._create_tokenized_object(
                                 tmp_obj, tmp_obj.text, input_ids, None
@@ -799,8 +847,25 @@ class TokenizerManager:
                             state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                             generators.append(self._wait_one_response(tmp_obj, state, request))
                             rids.append(tmp_obj.rid)
-                            if i == 1 and batch_size > 2:
-                                await asyncio.sleep(0)
+                        if batch_size > 2:
+                            await asyncio.sleep(0)
+                            f_sufs_rest = [
+                                self._tokenize_executor.submit(
+                                    self.tokenizer, texts[i][cut:], add_special_tokens=False
+                                )
+                                for i in range(2, batch_size)
+                            ]
+                            for i in range(2, batch_size):
+                                tmp_obj = obj[i]
+                                suf_i = (await asyncio.wrap_future(f_sufs_rest[i - 2]))["input_ids"]
+                                input_ids = pref_ids + suf_i
+                                self._validate_one_request(tmp_obj, input_ids)
+                                tokenized_obj = self._create_tokenized_object(
+                                    tmp_obj, tmp_obj.text, input_ids, None
+                                )
+                                state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                                generators.append(self._wait_one_response(tmp_obj, state, request))
+                                rids.append(tmp_obj.rid)
                     else:
                         cut = -1
                 if cut < 2048:

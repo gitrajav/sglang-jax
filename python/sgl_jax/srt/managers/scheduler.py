@@ -1635,6 +1635,7 @@ class Scheduler(
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0
         self.new_token_ratio = self.init_new_token_ratio
+        self.dp_round_robin_counter = 0
 
         flushed_items = (
             self.token_to_kv_pool_allocator.available_size()
@@ -2099,19 +2100,16 @@ class Scheduler(
 
         coop_reqs = []
         for r in range(self.dp_size):
-            prefix_len_r = pos_base + r * coop_chunk
             seq_len_r = pos_base + (r + 1) * coop_chunk
             creq = Req(
                 rid=f"__coop_prefill_{pos_base}_{r}",
                 origin_input_text="",
-                origin_input_ids=shared_token_ids[:seq_len_r],
+                origin_input_ids=[],
                 sampling_params=sampling_params,
                 dp_rank=r,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 vocab_size=self.model_config.vocab_size,
             )
-            creq.fill_ids = shared_token_ids[:seq_len_r]
-            creq.prefix_indices = full_kv_indices[:prefix_len_r]
             creq.extend_input_len = coop_chunk
             creq.req_pool_idx = coop_req_pool_idx
             creq.is_chunked = 1

@@ -224,6 +224,7 @@ class SchedulerOutputProcessorMixin:
         # for every req we visit (including retracted) so the counter stays
         # aligned with the selector / collected lists.
         req_idx = 0
+        unfinished_reqs_to_cache: list[Req] = []
 
         for dp_rank in range(batch.dp_size):
             info = batch.reqs_info[dp_rank]
@@ -260,8 +261,9 @@ class SchedulerOutputProcessorMixin:
                             ),
                         )
                     elif not info.decoding_reqs or req not in info.decoding_reqs:
-                        # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        # Defer radix tree update until immediately after stream_output
+                        # so TTFT is not blocked by host radix inserts.
+                        unfinished_reqs_to_cache.append(req)
 
                     if req.return_output_logprob_only:
                         req.output_token_logprobs_val.append(
@@ -363,6 +365,9 @@ class SchedulerOutputProcessorMixin:
             skip_stream_reqs,
             cache_miss_count,
         )
+
+        for req in unfinished_reqs_to_cache:
+            self.tree_cache.cache_unfinished_req(req)
 
         if result.next_draft_input is not None:
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
