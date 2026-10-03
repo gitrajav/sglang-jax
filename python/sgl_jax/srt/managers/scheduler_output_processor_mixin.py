@@ -186,13 +186,7 @@ class SchedulerOutputProcessorMixin:
         )
         if self.enable_overlap and not self.pd:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-                if (
-                    getattr(batch, "is_intermediate_chunked_prefill", False)
-                    and result.next_token_ids is None
-                ):
-                    next_token_ids = [0] * (batch.dp_size * batch.per_dp_bs_size)
-                else:
-                    next_token_ids = resolve_spec_prefill_token_ids(result)
+                next_token_ids = resolve_spec_prefill_token_ids(result)
                 if launch_done is not None:
                     launch_done.wait()
             else:

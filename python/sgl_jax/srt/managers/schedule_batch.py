@@ -3473,8 +3473,6 @@ class ScheduleBatch:
             dp_size=self.dp_size,
             per_dp_bs_size=self.per_dp_bs_size,
         )
-        if getattr(self, "is_intermediate_chunked_prefill", False):
-            copied.is_intermediate_chunked_prefill = True
         if getattr(self, "is_coop_prefill_batch", False):
             copied.is_coop_prefill_batch = True
         return copied

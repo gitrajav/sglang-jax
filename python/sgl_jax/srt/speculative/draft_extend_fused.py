@@ -2802,11 +2802,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         cache_miss_count = count()
     prefill_output_token_ids = None
-    if (
-        update_relay
-        and not getattr(model_worker_batch, "is_coop_prefill_batch", False)
-        and not getattr(model_worker_batch, "is_intermediate_chunked_prefill", False)
-    ):
+    if update_relay and not getattr(model_worker_batch, "is_coop_prefill_batch", False):
         prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
             draft_worker,
             next_token_ids,

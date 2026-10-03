@@ -2733,17 +2733,6 @@ class Scheduler(
             )
 
         new_batch.bid = acc_global_bid()
-        new_batch.is_intermediate_chunked_prefill = (
-            not new_batch.return_logprob
-            and not new_batch.return_output_logprob_only
-            and not new_batch.return_hidden_states
-            and not any(info.decoding_reqs for info in new_batch.reqs_info)
-            and all(
-                req.is_chunked > 0
-                for info in new_batch.reqs_info
-                for req in (info.reqs or ())
-            )
-        )
 
         return new_batch
 
@@ -3070,8 +3059,6 @@ class Scheduler(
             )
             if getattr(batch, "is_coop_prefill_batch", False):
                 model_worker_batch.is_coop_prefill_batch = True
-            if getattr(batch, "is_intermediate_chunked_prefill", False):
-                model_worker_batch.is_intermediate_chunked_prefill = True
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
