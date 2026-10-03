@@ -1636,6 +1636,7 @@ class Scheduler(
         self.forward_ct_decode = 0
         self.new_token_ratio = self.init_new_token_ratio
         self.dp_round_robin_counter = 0
+        self._consec_decode = 0
 
         flushed_items = (
             self.token_to_kv_pool_allocator.available_size()
@@ -2049,7 +2050,7 @@ class Scheduler(
         # waiting prefills starve running decodes (observed 110s spike at c64).
         df = getattr(self, "_decode_first_n", None)
         if df is None:
-            df = int(os.environ.get("SGL_DECODE_FIRST_INTERLEAVE", "5"))
+            df = int(os.environ.get("SGL_DECODE_FIRST_INTERLEAVE", "20"))
             self._decode_first_n = df
             self._consec_decode = 0
         skip_prefill = (
