@@ -766,20 +766,22 @@ class TokenizerManager:
                             self.tokenizer, texts[1][cut:], add_special_tokens=False
                         )
                         if cached_pref is not None and cached_pref[0] == pref_str:
+                            f_pref = None
                             pref_ids = cached_pref[1]
-                            suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
                         else:
                             f_pref = self._tokenize_executor.submit(self.tokenizer, pref_str)
-                            suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
-                            pref_ids = (await asyncio.wrap_future(f_pref))["input_ids"]
-                            self._last_prefix_token_cache = (pref_str, pref_ids)
-                        full0 = pref_ids + suf0
+                            pref_ids = None
                         f_sufs_rest = [
                             self._tokenize_executor.submit(
                                 self.tokenizer, texts[i][cut:], add_special_tokens=False
                             )
                             for i in range(2, batch_size)
                         ]
+                        suf0 = (await asyncio.wrap_future(f_suf0))["input_ids"]
+                        if f_pref is not None:
+                            pref_ids = (await asyncio.wrap_future(f_pref))["input_ids"]
+                            self._last_prefix_token_cache = (pref_str, pref_ids)
+                        full0 = pref_ids + suf0
                         for i in range(batch_size):
                             tmp_obj = obj[i]
                             if i == 0:

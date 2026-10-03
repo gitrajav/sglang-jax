@@ -3461,7 +3461,7 @@ class ScheduleBatch:
             new_info.spec_info = info.spec_info
             copied_reqs_info.append(new_info)
 
-        return ScheduleBatch(
+        copied = ScheduleBatch(
             reqs_info=copied_reqs_info,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
@@ -3473,6 +3473,11 @@ class ScheduleBatch:
             dp_size=self.dp_size,
             per_dp_bs_size=self.per_dp_bs_size,
         )
+        if getattr(self, "is_intermediate_chunked_prefill", False):
+            copied.is_intermediate_chunked_prefill = True
+        if getattr(self, "is_coop_prefill_batch", False):
+            copied.is_coop_prefill_batch = True
+        return copied
 
     def _evict_tree_cache_if_needed(self, num_tokens_per_dp: dict[int, int]) -> None:
         """Evict from tree cache for each DP rank that needs capacity."""

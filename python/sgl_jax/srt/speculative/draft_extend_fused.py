@@ -144,8 +144,10 @@ def _prepare_rejection_sampling(sampling_info, batch, total_bs: int, vocab_size:
 def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
     if draft_worker.mesh is None:
         return next_token_ids
+    replicated_sharding = NamedSharding(draft_worker.mesh, P())
+    if jax.typeof(next_token_ids).sharding == replicated_sharding:
+        return next_token_ids
     if not hasattr(draft_worker, "_spec_prefill_output_gather_fn"):
-        replicated_sharding = NamedSharding(draft_worker.mesh, P())
         draft_worker._spec_prefill_output_gather_fn = jax.jit(
             lambda x: x,
             out_shardings=replicated_sharding,
@@ -681,39 +683,48 @@ def _rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
 
 def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, per_dp_bs):
     per_dp_tokens = input_ids.shape[0] // dp_size
-    ids = input_ids.reshape(dp_size, per_dp_tokens)
-    ext = extend_seq_lens.reshape(dp_size, per_dp_bs)
-    verified = verified_id.reshape(dp_size, per_dp_bs)
-    tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
-        N = ext_rank.shape[0]
-        idx = jnp.arange(N)
-        mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
-        ext_rank_cumsum = jnp.dot(mask, ext_rank)
-
-        starts = ext_rank_cumsum - ext_rank
-        ends = starts + ext_rank
+        tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
+        ends = jnp.cumsum(ext_rank, dtype=jnp.int32)
+        starts = ends - ext_rank
         in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
 
-        one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
-        req_starts = jnp.dot(one_hot_slot, starts)
-        req_lens = jnp.dot(one_hot_slot, ext_rank)
-        req_verified = jnp.dot(one_hot_slot, verified_rank)
+        req_ends = ends[slot]
+        req_verified = verified_rank[slot]
+        shifted = jnp.concatenate([ids_rank[1:], ids_rank[-1:]], axis=0)
 
-        shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
-        one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
-        shifted = jnp.dot(one_hot_shifted, ids_rank)
+        is_last = has_req & (tok == (req_ends - 1))
+        rotated = jnp.where(is_last, req_verified, shifted)
+        return jnp.where(has_req, rotated, ids_rank)
 
-        is_last = has_req & ((tok - req_starts) == (req_lens - 1))
-        is_last_int = is_last.astype(jnp.int32)
-        rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
+    sharding = jax.typeof(input_ids).sharding
+    if (
+        isinstance(sharding, NamedSharding)
+        and not sharding.mesh.empty
+        and "data" in sharding.mesh.axis_names
+        and sharding.mesh.shape["data"] == dp_size
+        and dp_size > 1
+    ):
+        mesh = sharding.mesh
+        d1 = NamedSharding(mesh, P("data"))
+        if jax.typeof(extend_seq_lens).sharding != d1:
+            extend_seq_lens = jax.sharding.reshard(extend_seq_lens, d1)
+        if jax.typeof(verified_id).sharding != d1:
+            verified_id = jax.sharding.reshard(verified_id, d1)
+        return jax.shard_map(
+            rotate_rank,
+            mesh=mesh,
+            in_specs=(P("data"), P("data"), P("data")),
+            out_specs=P("data"),
+            check_vma=False,
+        )(input_ids, extend_seq_lens, verified_id)
 
-        has_req_int = has_req.astype(jnp.int32)
-        return has_req_int * rotated + (1 - has_req_int) * ids_rank
-
+    ids = input_ids.reshape(dp_size, per_dp_tokens)
+    ext = extend_seq_lens.reshape(dp_size, per_dp_bs)
+    verified = verified_id.reshape(dp_size, per_dp_bs)
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
 
@@ -919,8 +930,16 @@ def _build_draft_extend(num_layers: int, topk: int):
         last_idx = draft_logits_indices
         if logits_metadata.accept_lens is not None:
             last_idx = last_idx - (forward_batch.extend_seq_lens - logits_metadata.accept_lens)
-            last_idx = jnp.where(forward_batch.extend_seq_lens > 0, last_idx, 0)
-        if dp_size > 1:
+            last_idx = jnp.where(
+                forward_batch.extend_seq_lens > 0, last_idx, jnp.zeros_like(last_idx)
+            )
+        sh_h = jax.typeof(layer0_hidden).sharding
+        if dp_size > 1 and not (
+            isinstance(sh_h, NamedSharding)
+            and not sh_h.mesh.empty
+            and len(sh_h.spec) >= 1
+            and sh_h.spec[0] == "data"
+        ):
             per_dp_tokens = layer0_hidden.shape[0] // dp_size
             per_dp_bs = last_idx.shape[0] // dp_size
             rank_ids = jnp.arange(last_idx.shape[0], dtype=jnp.int32) // per_dp_bs
@@ -955,6 +974,8 @@ def _build_draft_extend(num_layers: int, topk: int):
                 relay_new_seq_lens,
                 dp_size=dp_size,
             )
+            selected_layer0_hidden = None
+            stacked_idx = None
 
         return (
             selected_layer0_hidden,
@@ -1863,8 +1884,14 @@ def _build_prefill(num_layers: int, topk: int):
         per_dp_bs,
         update_relay,
     ):
+        from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
         target_logits_metadata = replace(target_logits_metadata, preserve_vocab_sharding=True)
-        draft_logits_metadata = replace(draft_logits_metadata, preserve_vocab_sharding=True)
+        draft_logits_metadata = replace(
+            draft_logits_metadata,
+            preserve_vocab_sharding=True,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
         target_output, target_pool_updates, _, _ = target_model(
@@ -1875,7 +1902,18 @@ def _build_prefill(num_layers: int, topk: int):
 
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
-        next_token_ids = argmax_with_dp_sharding(target_logits)
+        next_token_ids_rep = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
+        sh_tl = jax.typeof(target_logits).sharding
+        if (
+            isinstance(sh_tl, NamedSharding)
+            and not sh_tl.mesh.empty
+            and "data" in sh_tl.mesh.axis_names
+        ):
+            next_token_ids = jax.sharding.reshard(
+                next_token_ids_rep, NamedSharding(sh_tl.mesh, P("data"))
+            )
+        else:
+            next_token_ids = next_token_ids_rep
         input_ids = _rotate_prefill_input_ids(
             draft_forward_batch.input_ids,
             draft_forward_batch.extend_seq_lens,
@@ -1921,13 +1959,21 @@ def _build_prefill(num_layers: int, topk: int):
         while len(all_topk_index) < num_layers:
             all_topk_index.append(all_topk_index[-1])
 
-        last_idx = draft_logits_indices
-        if dp_size > 1:
-            per_dp_tokens = layer0_hidden.shape[0] // dp_size
-            rank_ids = jnp.arange(last_idx.shape[0], dtype=jnp.int32) // per_dp_bs
-            last_idx = last_idx + rank_ids * per_dp_tokens
-
-        selected_layer0_hidden = _gather_rows_preserve_sharding(layer0_hidden, last_idx)
+        if layer0_hidden.shape[0] == draft_logits_indices.shape[0]:
+            selected_layer0_hidden = layer0_hidden
+        else:
+            last_idx = draft_logits_indices
+            sh_h = jax.typeof(layer0_hidden).sharding
+            if dp_size > 1 and not (
+                isinstance(sh_h, NamedSharding)
+                and not sh_h.mesh.empty
+                and len(sh_h.spec) >= 1
+                and sh_h.spec[0] == "data"
+            ):
+                per_dp_tokens = layer0_hidden.shape[0] // dp_size
+                rank_ids = jnp.arange(last_idx.shape[0], dtype=jnp.int32) // per_dp_bs
+                last_idx = last_idx + rank_ids * per_dp_tokens
+            selected_layer0_hidden = _gather_rows_preserve_sharding(layer0_hidden, last_idx)
         if topk == 1:
             stacked_idx = jnp.stack([idx[:, 0] for idx in all_topk_index], axis=1)
         else:
@@ -1938,9 +1984,11 @@ def _build_prefill(num_layers: int, topk: int):
         relay_new_seq_lens = target_forward_batch.seq_lens + 1
         if mesh is not None and not update_relay:
             rep = NamedSharding(mesh, P())
-            next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), rep)
+            next_token_ids_out = jax.sharding.reshard(next_token_ids_rep, rep)
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
             stacked_idx = jax.sharding.reshard(stacked_idx, rep)
+        else:
+            next_token_ids_out = next_token_ids_rep
 
         updated_relay_buffers = relay_buffers
         if update_relay:
@@ -1954,10 +2002,13 @@ def _build_prefill(num_layers: int, topk: int):
                 relay_new_seq_lens,
                 dp_size=dp_size,
             )
+            target_output = replace(target_output, next_token_logits=None, hidden_states=None)
+            selected_layer0_hidden = None
+            stacked_idx = None
 
         return (
             target_output,
-            next_token_ids,
+            next_token_ids_out,
             target_pool_updates,
             tuple(all_pool_updates),
             selected_layer0_hidden,
@@ -2751,7 +2802,11 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         cache_miss_count = count()
     prefill_output_token_ids = None
-    if update_relay and not getattr(model_worker_batch, "is_coop_prefill_batch", False):
+    if (
+        update_relay
+        and not getattr(model_worker_batch, "is_coop_prefill_batch", False)
+        and not getattr(model_worker_batch, "is_intermediate_chunked_prefill", False)
+    ):
         prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
             draft_worker,
             next_token_ids,

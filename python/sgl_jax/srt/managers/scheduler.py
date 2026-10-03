@@ -2163,15 +2163,15 @@ class Scheduler(
             # Cooperative prefill completed! Drain any remaining tokenized requests
             # from tokenizer_manager in lockstep across all nodes.
             empty_polls = 0
-            for _ in range(80):
+            for _ in range(200):
                 if (
                     len(self.waiting_queue) >= self.dp_size
-                    or empty_polls >= 25
-                    or (len(self.waiting_queue) >= 16 and empty_polls >= 4)
+                    or empty_polls >= 40
+                    or (len(self.waiting_queue) >= 16 and empty_polls >= 6)
                 ):
                     break
                 if self.node_rank == 0:
-                    time.sleep(0.01)
+                    time.sleep(0.002)
                 more_reqs = (
                     self._comm_backend.recv_requests()
                     if self._comm_backend is not None
@@ -2278,11 +2278,11 @@ class Scheduler(
         # wait briefly in lockstep for the 2nd request of a batch to arrive
         # so we can compute the exact shared system prompt LCP.
         if len(self.waiting_queue) == 1:
-            for _ in range(40):
+            for _ in range(200):
                 if len(self.waiting_queue) >= 2:
                     break
                 if self.node_rank == 0:
-                    time.sleep(0.015)
+                    time.sleep(0.002)
                 more_reqs = (
                     self._comm_backend.recv_requests()
                     if self._comm_backend is not None
@@ -2733,6 +2733,17 @@ class Scheduler(
             )
 
         new_batch.bid = acc_global_bid()
+        new_batch.is_intermediate_chunked_prefill = (
+            not new_batch.return_logprob
+            and not new_batch.return_output_logprob_only
+            and not new_batch.return_hidden_states
+            and not any(info.decoding_reqs for info in new_batch.reqs_info)
+            and all(
+                req.is_chunked > 0
+                for info in new_batch.reqs_info
+                for req in (info.reqs or ())
+            )
+        )
 
         return new_batch
 
@@ -3059,6 +3070,8 @@ class Scheduler(
             )
             if getattr(batch, "is_coop_prefill_batch", False):
                 model_worker_batch.is_coop_prefill_batch = True
+            if getattr(batch, "is_intermediate_chunked_prefill", False):
+                model_worker_batch.is_intermediate_chunked_prefill = True
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
