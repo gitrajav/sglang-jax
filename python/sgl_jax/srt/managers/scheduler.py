@@ -2189,9 +2189,13 @@ class Scheduler(
                 self.process_input_requests(ready_reqs)
 
             coop_target_len = st["coop_target_len"]
+            coop_partial_len = st.get("coop_partial_len", coop_target_len)
+            coop_chunk = int(st.get("coop_chunk", self.chunked_prefill_size or 1024))
             is_eagle_cache = getattr(self.tree_cache, "is_eagle", False)
             key_token_len = coop_target_len + 1 if is_eagle_cache else coop_target_len
+            partial_key_token_len = coop_partial_len + 1 if is_eagle_cache else coop_partial_len
             shared_tokens = st["shared_token_ids"][:key_token_len]
+            partial_shared_tokens = st["shared_token_ids"][:partial_key_token_len]
             key_convert_fn = getattr(self.tree_cache, "key_convert_fn", None)
             converted_shared = (
                 key_convert_fn(shared_tokens) if key_convert_fn is not None else shared_tokens
@@ -2204,6 +2208,36 @@ class Scheduler(
             except ImportError:
                 _use_insert_params = False
                 MatchResult = None
+
+            if self.running_batch.is_empty() and len(self.waiting_queue) <= self.dp_size:
+                for idx, wreq in enumerate(self.waiting_queue):
+                    wreq.dp_rank = idx
+
+            partial_wreq_by_rank = {}
+            if (
+                coop_partial_len > coop_target_len
+                and coop_partial_len <= coop_target_len + self.page_size
+                and len(full_kv_indices) >= coop_Target_page_end
+                if (coop_Target_page_end := coop_target_len + self.page_size) > 0
+                else False
+            ):
+                seen_ranks = set()
+                for wreq in self.waiting_queue:
+                    r = wreq.dp_rank
+                    if r is None or r in seen_ranks:
+                        continue
+                    seen_ranks.add(r)
+                    rem_std = len(wreq.origin_input_ids) - coop_target_len
+                    rem_part = len(wreq.origin_input_ids) - coop_partial_len
+                    if (
+                        rem_std > coop_chunk
+                        and (rem_std % coop_chunk) > 256
+                        and (rem_part % coop_chunk) <= 256
+                        and len(wreq.radix_input_ids) >= partial_key_token_len
+                        and wreq.radix_input_ids[:partial_key_token_len] == partial_shared_tokens
+                    ):
+                        partial_wreq_by_rank[r] = wreq
+
             coop_match_by_rank = {}
             root_children = getattr(getattr(self.tree_cache, "root_node", None), "children", None)
             get_child_key_fn = getattr(self.tree_cache, "get_child_key_fn", None)
@@ -2214,29 +2248,42 @@ class Scheduler(
                     self.tree_cache.insert(InsertParams(key=rkey, value=rval))
                 else:
                     self.tree_cache.insert(rkey, rval)
-                if len(full_kv_indices) > coop_target_len:
-                    extra_indices = np.unique(full_kv_indices[coop_target_len:])
+                free_from = (
+                    coop_target_len + self.page_size
+                    if r in partial_wreq_by_rank
+                    else coop_target_len
+                )
+                if len(full_kv_indices) > free_from:
+                    extra_indices = np.unique(full_kv_indices[free_from:])
                     self.token_to_kv_pool_allocator.free(
                         extra_indices, dp_rank=r
                     )
                 if MatchResult is not None and root_children is not None and get_child_key_fn is not None:
                     child = root_children.get(get_child_key_fn(rkey))
                     if child is not None and len(child.key) == len(rkey) and not child.children:
-                        coop_match_by_rank[r] = MatchResult(
-                            device_indices=np.asarray(child.value, dtype=np.int32),
-                            last_device_node=child,
-                            last_host_node=child,
-                            best_match_node=child,
-                            host_hit_length=0,
-                        )
+                        if r in partial_wreq_by_rank:
+                            partial_wreq_by_rank[r]._coop_prematched_result = MatchResult(
+                                device_indices=full_kv_indices[:coop_partial_len].copy(),
+                                last_device_node=child,
+                                last_host_node=child,
+                                best_match_node=child,
+                                host_hit_length=0,
+                            )
+                        else:
+                            coop_match_by_rank[r] = MatchResult(
+                                device_indices=np.asarray(child.value, dtype=np.int32),
+                                last_device_node=child,
+                                last_host_node=child,
+                                best_match_node=child,
+                                host_hit_length=0,
+                            )
             self._coop_prefill_state = None
 
-            if self.running_batch.is_empty() and len(self.waiting_queue) <= self.dp_size:
-                for idx, wreq in enumerate(self.waiting_queue):
-                    wreq.dp_rank = idx
             if is_eagle_cache and shared_tokens:
                 last_shared_tok = shared_tokens[-1]
                 for wreq in self.waiting_queue:
+                    if getattr(wreq, "_coop_prematched_result", None) is not None:
+                        continue
                     if (
                         len(wreq.radix_input_ids) >= key_token_len
                         and wreq.radix_input_ids[key_token_len - 1] == last_shared_tok
@@ -2309,6 +2356,7 @@ class Scheduler(
         is_eagle_cache = getattr(self.tree_cache, "is_eagle", False)
         effective_lcp_len = max(0, lcp_len - 1) if is_eagle_cache else lcp_len
         coop_target_len = (effective_lcp_len // self.page_size) * self.page_size
+        coop_partial_len = (effective_lcp_len // 4) * 4
         if coop_target_len < 4096:
             return None
 
@@ -2394,6 +2442,9 @@ class Scheduler(
             "cur_pos": 0,
             "coop_chunk": coop_chunk,
             "coop_target_len": coop_target_len,
+            "coop_partial_len": (
+                coop_partial_len if len(common_pages) >= total_new_pages else coop_target_len
+            ),
             "total_coop_end": total_coop_end,
             "shared_token_ids": shared_token_ids,
             "extra_key": extra_key,

@@ -691,7 +691,11 @@ class PrefillAdder:
                     prefix_len = len(req.prefix_indices)
                     req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
 
-            req.last_matched_prefix_len = prefix_len
+            req.last_matched_prefix_len = (
+                (prefix_len // self.page_size) * self.page_size
+                if self.page_size > 1
+                else prefix_len
+            )
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             # Recurrent track-boundary cap: never let a scheduled EXTEND cross a

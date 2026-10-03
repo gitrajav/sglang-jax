@@ -524,7 +524,12 @@ class Req:
                 self.last_node = match_result.last_device_node
                 self.last_host_node = match_result.last_host_node
                 self.host_hit_length = match_result.host_hit_length
-            self.last_matched_prefix_len = len(self.prefix_indices)
+            if getattr(tree_cache, "page_size", 1) > 1:
+                self.last_matched_prefix_len = (
+                    len(self.prefix_indices) // tree_cache.page_size
+                ) * tree_cache.page_size
+            else:
+                self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_len(self) -> int:
