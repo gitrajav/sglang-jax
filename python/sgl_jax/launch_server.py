@@ -10,6 +10,11 @@ from sgl_jax.raiden import preload_raiden_if_requested
 if any(arg.split("=", 1)[0] == "--save-aot" for arg in sys.argv[1:]):
     os.environ["JAX_PLATFORMS"] = "cpu"
 else:
+    _libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
+    if _libtpu_args and "xla_tpu_control_large_2nd_minor_layout_for_x16" not in _libtpu_args:
+        os.environ["LIBTPU_INIT_ARGS"] = (
+            f"{_libtpu_args} --xla_tpu_control_large_2nd_minor_layout_for_x16=false"
+        )
     preload_raiden_if_requested()
 
 
