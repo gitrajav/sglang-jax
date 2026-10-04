@@ -336,7 +336,11 @@ class MLAAttentionBackend(AttentionBackend):
         has_tensor_axis = self.mesh is not None and "tensor" in self.mesh.axis_names
         q_spec = P(dpa, "tensor", None) if has_tensor_axis else P(dpa, None, None)
 
-        cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        cache = (
+            token_to_kv_pool[layer.layer_id]
+            if isinstance(token_to_kv_pool, (list, tuple))
+            else token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        )
         if new_kv_c.dtype != cache.dtype:
             new_kv_c = new_kv_c.astype(cache.dtype)
         if new_k_pe.dtype != cache.dtype:
