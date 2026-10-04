@@ -889,14 +889,21 @@ def _build_draft_extend(num_layers: int, topk: int):
 
             forward_batch.spec_info.hidden_states = step_hidden
             forward_batch.input_ids = input_ids
+            forward_batch.readonly_kv = i >= len(all_memory_pools)
             if relay_on and _RELAY_POS and i > 0:
                 forward_batch.positions = positions0 + i
 
+            cur_pool = (
+                all_memory_pools[pool_idx]
+                if i < len(all_memory_pools)
+                else all_pool_updates[-1]
+            )
             output, pool_updates, _, _ = model(
-                forward_batch, all_memory_pools[pool_idx], logits_metadata
+                forward_batch, cur_pool, logits_metadata
             )
             if i < len(all_memory_pools):
                 all_pool_updates.append(pool_updates)
+            forward_batch.readonly_kv = False
 
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else None

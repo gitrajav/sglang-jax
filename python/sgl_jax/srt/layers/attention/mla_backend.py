@@ -25,7 +25,11 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
+from sgl_jax.srt.kernels.mla.v2.kernel import (
+    cdiv,
+    mla_ragged_paged_attention,
+    mla_ragged_paged_attention_readonly,
+)
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -326,6 +330,7 @@ class MLAAttentionBackend(AttentionBackend):
         if jax.typeof(new_k_pe).sharding != k_pe_sharding:
             new_k_pe = jax.sharding.reshard(new_k_pe, k_pe_sharding)
         skip_decode = forward_batch.forward_mode != ForwardMode.DECODE
+        readonly_kv = bool(getattr(forward_batch, "readonly_kv", False)) and skip_decode
         ql_nope = q
         q_pe = q_rope
         has_tensor_axis = self.mesh is not None and "tensor" in self.mesh.axis_names
@@ -433,6 +438,60 @@ class MLAAttentionBackend(AttentionBackend):
                 vmem_limit_bytes=self.vmem_limit_bytes,
                 skip_decode=skip_decode,
             )
+
+        if readonly_kv:
+            def _run_ro(
+                ql_nope_,
+                q_pe_,
+                new_kv_c_,
+                new_k_pe_,
+                cache_,
+                seq_lens_,
+                page_indices_,
+                cu_q_lens_,
+                cu_kv_lens_,
+                distribution_,
+            ):
+                return mla_ragged_paged_attention_readonly(
+                    ql_nope_,
+                    q_pe_,
+                    new_kv_c_,
+                    new_k_pe_,
+                    cache_,
+                    seq_lens_,
+                    page_indices_,
+                    cu_q_lens_,
+                    cu_kv_lens_,
+                    distribution_,
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    soft_cap=soft_cap,
+                    num_kv_pages_per_block=self.num_kv_pages_per_block,
+                    num_queries_per_block=self.num_queries_per_block,
+                    decode_batch_size=self.decode_batch_size,
+                    vmem_limit_bytes=self.vmem_limit_bytes,
+                    skip_decode=skip_decode,
+                )
+
+            o_latent = jax.shard_map(
+                _run_ro,
+                mesh=self.mesh,
+                in_specs=in_specs,
+                out_specs=q_spec,
+                check_vma=False,
+            )(
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                cache,
+                self.forward_metadata.seq_lens,
+                self.forward_metadata.page_indices,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+            )
+            return o_latent, cache
 
         o_latent, updated_cache = jax.shard_map(
             _run,

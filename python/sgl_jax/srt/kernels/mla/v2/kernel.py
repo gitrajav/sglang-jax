@@ -292,6 +292,7 @@ def _mla_ragged_paged_attention_kernel(
     bq_sz,
     batch_size: int = 1,
     debug_mode: bool = False,
+    readonly_kv: bool = False,
 ):
     assert ql_nope_hbm_ref.shape == o_hbm_ref.shape
     # Validation checks on the dimensions
@@ -428,7 +429,7 @@ def _mla_ragged_paged_attention_kernel(
             cp.start()
 
     def _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
-        if not wait:
+        if not wait and not readonly_kv:
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
 
@@ -1163,9 +1164,10 @@ def _mla_ragged_paged_attention_kernel(
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in first bq loop.
-                @pl.when(bq_idx == 0)
-                def update_cur_bkv_to_cache():
-                    start_update_kv_cache(batch_start_seq_idx, bkv_sem_idx, offsets, update_szs)
+                if not readonly_kv:
+                    @pl.when(bq_idx == 0)
+                    def update_cur_bkv_to_cache():
+                        start_update_kv_cache(batch_start_seq_idx, bkv_sem_idx, offsets, update_szs)
 
                 # Load bkv into vreg. There is no need to mask out invalid k/v entries,
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
@@ -1257,7 +1259,8 @@ def _mla_ragged_paged_attention_kernel(
     def epilogue():
         for i in range(2):
             wait_send_bo(i)
-            wait_update_kv_cache(i)
+            if not readonly_kv:
+                wait_update_kv_cache(i)
 
     ### ------- Kernel end ------- ###
 
@@ -1344,6 +1347,7 @@ def prepare_outputs(
         "decode_batch_size",
         "debug_mode",
         "skip_decode",
+        "readonly_kv",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1377,6 +1381,7 @@ def mla_ragged_paged_attention(
     # Debug params.
     debug_mode: bool = False,
     skip_decode: bool = False,
+    readonly_kv: bool = False,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
     jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128) + align_to(r_dim, 128)]
@@ -1647,6 +1652,61 @@ def mla_ragged_paged_attention(
         )
 
         scope_name = f"MLA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}-bsz_{batch_size}"
+        if readonly_kv:
+            scope_name_ro = f"{scope_name}-ro"
+
+            def _ro_entry(*args):
+                return _mla_ragged_paged_attention_kernel(
+                    *args[:14],
+                    None,
+                    *args[14:],
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    soft_cap=soft_cap,
+                    mask_value=mask_value,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    static_q_len=static_q_len,
+                    bq_sz=bq_sz,
+                    bkv_p=bkv_p,
+                    batch_size=batch_size,
+                    debug_mode=debug_mode,
+                    readonly_kv=True,
+                )
+
+            kernel = jax.named_scope(scope_name_ro)(
+                pl.pallas_call(
+                    _ro_entry,
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=len(scalar_prefetches),
+                        in_specs=in_specs,
+                        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                        grid=grid,
+                        scratch_shapes=scratch_shapes,
+                    ),
+                    compiler_params=pltpu.CompilerParams(
+                        dimension_semantics=("arbitrary",),
+                        vmem_limit_bytes=vmem_limit_bytes,
+                        disable_bounds_checks=True,
+                    ),
+                    out_shape=jax.ShapeDtypeStruct(shape=ql_nope.shape, dtype=ql_nope.dtype),
+                    input_output_aliases={
+                        8: 0,  # Alias output activation with ql_nope
+                    },
+                    name=scope_name_ro,
+                )
+            )
+            o_out = kernel(
+                *scalar_prefetches,
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                cache_kv,
+            )
+            return o_out, cache_kv
+
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -1763,3 +1823,27 @@ def mla_ragged_paged_attention(
     )  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
 
     return output, updated_kv
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "sliding_window",
+        "soft_cap",
+        "mask_value",
+        "q_scale",
+        "k_scale",
+        "v_scale",
+        "chunk_prefill_size",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+        "decode_batch_size",
+        "debug_mode",
+        "skip_decode",
+    ),
+)
+def mla_ragged_paged_attention_readonly(*args, **kwargs) -> jax.Array:
+    out, _ = mla_ragged_paged_attention.__wrapped__(*args, readonly_kv=True, **kwargs)
+    return out

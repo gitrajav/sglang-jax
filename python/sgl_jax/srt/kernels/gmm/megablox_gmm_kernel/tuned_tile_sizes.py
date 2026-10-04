@@ -87,9 +87,7 @@ TUNED_TILE_SIZES_GMM_V2 = {
         },
         **{
             ("bfloat16", "bfloat16", g, m, 6144, 2048): (
-                min(128, m)
-                if m <= 1024
-                else (32 if m <= 2048 else (64 if m <= 8192 else (128 if m <= 32768 else 256))),
+                min(128, m) if m <= 65536 else 256,
                 6144,
                 1024,
             )
@@ -114,9 +112,7 @@ TUNED_TILE_SIZES_GMM_V2 = {
         },
         **{
             ("bfloat16", "bfloat16", g, m, 2048, 6144): (
-                min(128, m)
-                if m <= 1024
-                else (32 if m <= 2048 else (64 if m <= 8192 else (128 if m <= 32768 else 256))),
+                min(128, m) if m <= 65536 else 256,
                 2048,
                 3072,
             )
