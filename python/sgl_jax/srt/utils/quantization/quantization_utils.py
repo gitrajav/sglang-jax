@@ -346,6 +346,24 @@ def quantize_tensor_simple(
     return x_q, scale.astype(out_dtype)
 
 
+@jax.jit(static_argnames=("dtype", "axis"))
+def _quantize_per_channel_jit(
+    tensor: jax.Array, dtype: jnp.dtype, axis: tuple[int, ...]
+) -> tuple[jax.Array, jax.Array]:
+    dtype_info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
+    dtype_max = float(dtype_info.max)
+    dtype_min = float(dtype_info.min)
+    abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True).astype(jnp.float32)
+    scale = abs_max / dtype_max
+    scale_safe = scale + (scale == 0).astype(scale.dtype)
+    tensor_scaled = tensor.astype(jnp.float32) / scale_safe
+    if jnp.issubdtype(dtype, jnp.integer):
+        tensor_scaled = jnp.round(tensor_scaled)
+    tensor_q = jnp.clip(tensor_scaled, dtype_min, dtype_max).astype(dtype)
+    scale = jnp.squeeze(scale, axis).astype(jnp.float32)
+    return tensor_q, scale
+
+
 def quantize_tensor(
     dtype: jnp.dtype,
     tensor: jax.Array,
@@ -370,6 +388,9 @@ def quantize_tensor(
         axis = [i for i in range(tensor.ndim)]
     if isinstance(axis, int):
         axis = [axis]
+
+    if block_size is None:
+        return _quantize_per_channel_jit(tensor, dtype, tuple(axis))
 
     orig_shape = tensor.shape
     original_input_sharding = _array_sharding(tensor)

@@ -503,8 +503,6 @@ class Glm5Attention(nnx.Module):
                 dsa_kwargs["q_idx"] = q_idx
                 dsa_kwargs["k_idx"] = k_idx
                 dsa_kwargs["idx_weights"] = idx_w
-        elif self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
@@ -1373,10 +1371,13 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         # GLM-5.1-FP8 ships modules_to_not_convert with HF naming (e.g.
         # `self_attn.indexers_proj`); translate to sglang-jax module paths so
         # quantize_model leaves the unquantized indexer head-gate as LinearBase.
-        if mc.quantization_config is not None and mc.quantization_config.is_static_checkpoint:
+        if mc.quantization_config is not None:
+            extra_ignored = ["indexer.weights_proj"]
+            if not getattr(mc.hf_config, "use_dsa_sparse", False):
+                extra_ignored.extend(["indexer.wq_b", "indexer.wk"])
             mc.quantization_config.ignored_layers = list(
                 mc.quantization_config.ignored_layers or []
-            ) + ["indexer.weights_proj"]
+            ) + extra_ignored
             # indexer.wk has out_dim=128 == block_size_out (single N-block); the
             # narrow-N guard would reject it but the indexer output is currently
             # discarded so accuracy is unaffected. Match deepseek_v3 config.

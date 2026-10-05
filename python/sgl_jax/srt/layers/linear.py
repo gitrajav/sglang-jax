@@ -489,16 +489,26 @@ class QuantizedLinear(nnx.Module):
         # as q_b_proj. Explicitly reshard the scale to its expected spec — a no-op
         # when it is already correctly sharded.
         scale_val = jax.sharding.reshard(scale_val, NamedSharding(self.mesh, w_scale_spec))
-        in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+        x_spec = P("data", input_axis)
+        if jax.typeof(x_2d).sharding != NamedSharding(self.mesh, x_spec):
+            x_2d = jax.sharding.reshard(x_2d, NamedSharding(self.mesh, x_spec))
+        wq_val = self.weight_q.value
+        wq_spec = P(output_axis, input_axis)
+        if jax.typeof(wq_val).sharding != NamedSharding(self.mesh, wq_spec):
+            wq_val = jax.sharding.reshard(wq_val, NamedSharding(self.mesh, wq_spec))
+        in_specs = (x_spec, wq_spec, w_scale_spec)
 
         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
-        output_partition_dim = _shard_map_output_partition_dim(target, input_axis)
+        eff_reduce_axis = (
+            input_axis if (input_axis and self.mesh.shape.get(input_axis, 1) > 1) else None
+        )
+        output_partition_dim = _shard_map_output_partition_dim(target, eff_reduce_axis)
 
         output = shard_map(
             partial(
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
-                reduce_axis=input_axis,
+                reduce_axis=eff_reduce_axis,
                 compute_dtype=self.compute_dtype,
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
@@ -509,7 +519,7 @@ class QuantizedLinear(nnx.Module):
             in_specs=in_specs,
             out_specs=target.spec,
             check_vma=False,
-        )(x_2d, self.weight_q.value, scale_val)
+        )(x_2d, wq_val, scale_val)
 
         # Reshape back to original batch dimensions.
         if x.ndim > 2:

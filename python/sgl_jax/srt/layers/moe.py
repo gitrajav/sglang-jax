@@ -479,21 +479,20 @@ class EPMoE(nnx.Module):
                 axis=1,
                 block_size=block_size_k,
             )
+            self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", None, "tensor"))
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_1.value,
                 axis=1,
                 block_size=block_size_k,
             )
+            self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", None, "tensor"))
             wo_value, wo_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wo.value,
                 axis=1,
                 block_size=block_size_k,
             )
-
-            self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", None, "tensor"))
-            self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", None, "tensor"))
             self.wo = nnx.Param(wo_value, out_sharding=P("expert", "tensor", None))
 
             if block_size_k is not None:
