@@ -533,13 +533,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         return
 
     summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    summary += "| batch size | latency (s) | ttft (s) | input throughput (tok/s) | output throughput (tok/s) | acc length | ITL (ms) | cache hit % | input cost ($/1M) | output cost ($/1M) | slice CUD out ($/1M) |"
+    summary += "| batch size | latency (s) | ttft (s) | input throughput (tok/s) | output throughput (tok/s) | acc length | ITL (ms) | cache hit % | input cost ($/1M) | output cost ($/1M) |"
 
     if bench_args.profile:
         summary += " profile |"
 
     summary += "\n"
-    summary += "| ---------- | ----------- | -------- | ------------------------ | ------------------------- | ---------- | -------- | ----------- | ----------------- | ------------------ | -------------------- |"
+    summary += "| ---------- | ----------- | -------- | ------------------------ | ------------------------- | ---------- | -------- | ----------- | ----------------- | ------------------ |"
 
     if bench_args.profile:
         summary += "-------------|"
@@ -575,8 +575,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             f"{accept_length} | "
             f"{1 / (output_throughput / batch_size) * 1000:.2f} | "
             f"{prefix_cache_hit_rate * 100:.1f}% | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.3f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.3f} | "
+            f"{1e6 / (input_throughput * input_util) / 3600 * slice_hourly_cost:.2f} | "
             f"{1e6 / output_throughput / 3600 * slice_hourly_cost:.2f} |"
         )
         if trace_link:
